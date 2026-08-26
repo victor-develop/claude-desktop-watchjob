@@ -79,6 +79,15 @@ scripts/watch-loop.sh --name pr-123 --probe scripts/templates/probe-github-pr.sh
 | `probe-pr-and-slack.sh` | both of the above as a *single* watch | `REPO` `PR` `GITHUB_SELF` `CHANNEL` `THREAD_TS` `SLACK_SELF` |
 | `probe-http-json.sh` | any endpoint returning a JSON list | `URL` `MAP` |
 
+The Slack template supports both slackcli command shapes, trying them in order and only
+falling back if the first fails: `slackcli conversations read <channel> --thread-ts <ts>`
+(0.7+) and `slackcli messages --channel <channel> --thread <ts>` (older builds). It also
+normalises their differing output — 0.7+ puts users in a top-level `users[]` and messages
+carry only `.user`, so the template joins on id to recover display names, and it skips the
+progress lines that build prints to stdout before the JSON. If neither shape works it exits 3
+carrying both attempts' stderr, rather than degrading into "no new messages" — the failure
+mode that is hardest to notice.
+
 Each template's header comment documents its optional knobs (timeouts, body truncation, bot
 filters). Writing your own is a matter of printing a JSON array — see
 [`references/sources.md`](references/sources.md).

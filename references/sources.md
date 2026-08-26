@@ -13,6 +13,18 @@ probe 的唯一职责:**把当前状态压成一个 JSON 数组**,每项带一�
 | `probe-pr-and-slack.sh` | 上面两个合成一个 watch(见下) | `REPO` `PR` `GITHUB_SELF` `CHANNEL` `THREAD_TS` `SLACK_SELF` |
 | `probe-http-json.sh` | 任意返回 JSON 列表的接口 | `URL` `MAP` |
 
+`probe-slack-thread.sh` 兼容两种 slackcli 命令形状,按顺序尝试、只有第一种失败才试第二种:
+
+```text
+1. slackcli conversations read <channel> --thread-ts <ts> --limit N --json   (0.7+)
+2. slackcli messages --channel <channel> --thread <ts> --json               (更早的版本)
+```
+
+输出结构也一并归一:0.7+ 把用户信息平铺在顶层 `users[]`、消息里只有 `.user`,模板按 id
+关联出姓名;老版本消息自带 `.user_name` 就直接用。0.7+ 还会先往 stdout 打进度行
+(`- Fetching messages...`),模板从第一个 `{` 开始截。两种形状都不认时报 exit 3,并把两次
+尝试的 stderr 一起带出来 —— 不让它退化成「没有新消息」,那种失败最难发现。
+
 配置全走环境变量,所以模板可以直接当 `--probe` 用,不需要改文件:
 
 ```bash
