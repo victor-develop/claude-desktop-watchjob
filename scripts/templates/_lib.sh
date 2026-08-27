@@ -67,6 +67,10 @@ run_with_timeout() {
 # 不会让循环静默跳过事件,只是不为抖动叫醒你。真正的坏配置(token 过期、频道 ID 写错)
 # 每次都失败,重试完照样 exit 12,该报的还是会报,只是晚 RETRY_SLEEP*N 秒。
 #
+# 只按退出码判失败,不看输出是否为空 —— 空输出常常是合法结果(还没有人 review 的 PR、
+# 空 thread),当成失败会把它重试到超时再判整个 probe 失败。要不要接受空输出由调用方
+# 自己判断,它才知道这个 endpoint 空着正不正常。
+#
 # 次数与间隔可用 RETRY_TIMES / RETRY_SLEEP 覆盖;默认 3 次、间隔 5 秒。
 fetch_with_retry() {
   local secs="$1"; shift
@@ -74,7 +78,7 @@ fetch_with_retry() {
   local attempt=1 out rc
   while :; do
     out=$(run_with_timeout "$secs" "$@"); rc=$?
-    if [ $rc -eq 0 ] && [ -n "$out" ]; then
+    if [ $rc -eq 0 ]; then
       printf '%s' "$out"
       return 0
     fi
