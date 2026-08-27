@@ -23,13 +23,13 @@ TIMEOUT="${TIMEOUT:-25}"
 
 # 先确认 PR 本身拿得到 —— repo 写错、token 过期、限流都在这一步大声失败。
 # 不先做这步的话,下面「拿不到 checks 就当还没开始」会把认证问题伪装成安静等待。
-STATE=$(run_with_timeout "$TIMEOUT" gh pr view "$PR" --repo "$REPO" --json state --jq .state 2>&1)
+STATE=$(fetch_with_retry "$TIMEOUT" gh pr view "$PR" --repo "$REPO" --json state --jq .state 2>&1)
 if [ -z "$STATE" ] || [ "${STATE#*rror}" != "$STATE" ] || [ "${STATE#*not found}" != "$STATE" ]; then
   echo "gh pr view 失败: $REPO#$PR —— $STATE" >&2
   exit 3
 fi
 
-RAW=$(run_with_timeout "$TIMEOUT" gh pr checks "$PR" --repo "$REPO" --json name,state,link,bucket 2>/dev/null)
+RAW=$(fetch_with_retry "$TIMEOUT" gh pr checks "$PR" --repo "$REPO" --json name,state,link,bucket 2>/dev/null)
 rc=$?
 
 # 到这一步 PR 是拿得到的,所以非 0 / 空基本只剩「一个 check 都还没建起来」这一种解释,
