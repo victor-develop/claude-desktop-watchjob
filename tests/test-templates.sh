@@ -84,6 +84,8 @@ cat > "$STUB/slackcli" <<'STUBEOF'
 # STUB_FAIL_FILE 指向一个还不存在的路径时，第一次调用先失败并创建它，之后正常返回。
 # 用来测「一次抖动不该打死循环」的重试。
 [ -n "${STUB_SLACK_ALWAYS_FAIL:-}" ] && { echo "network unreachable" >&2; exit 1; }
+# 正常退出但没有输出：模板该立刻判空，而不是重试到超时
+[ -n "${STUB_SLACK_EMPTY:-}" ] && exit 0
 if [ -n "${STUB_FAIL_FILE:-}" ] && [ ! -f "$STUB_FAIL_FILE" ]; then
   : > "$STUB_FAIL_FILE"
   echo "transient network error" >&2
@@ -197,6 +199,9 @@ eq "回退时用 user_name" "$(echo "$OUT_LEGACY" | jq -r '.[0].who')" "alice"
 FAIL_ONCE="$T/slack-failed-once"
 OUT_RETRY=$(STUB_FAIL_FILE="$FAIL_ONCE" RETRY_TIMES=2 RETRY_SLEEP=0 "$T_DIR/probe-slack-thread.sh")
 eq "抖一次能重试回来" "$(echo "$OUT_RETRY" | jq 'length')" "1"
+# 空输出是合法结果（还没人 review 的 PR、空 thread），不该被当成失败去重试
+STUB_SLACK_EMPTY=1 RETRY_TIMES=3 RETRY_SLEEP=9 "$T_DIR/probe-slack-thread.sh" >/dev/null 2>&1
+eq "空输出不触发重试" "$?" "3"
 # 一直失败仍然要失败，不能被重试吞掉
 STUB_SLACK_ALWAYS_FAIL=1 RETRY_TIMES=2 RETRY_SLEEP=0 "$T_DIR/probe-slack-thread.sh" >/dev/null 2>&1
 eq "一直失败仍 exit 3" "$?" "3"
