@@ -34,7 +34,10 @@ CURSOR="${PROBE_CURSOR:-}"
 enc=$(printf '%s' "$CURSOR" | jq -sRr @uri)
 REQ_URL=${URL//\{\{cursor\}\}/$enc}
 
-curl_args=(-sS --max-time "$TIMEOUT" --fail-with-body)
+# 重试同理于 _lib.sh 的 fetch_with_retry：一次抖动不该把循环打死。curl 自带重试，
+# --retry-all-errors 让它连接失败/超时也重试，不只重试 5xx。
+curl_args=(-sS --max-time "$TIMEOUT" --fail-with-body
+           --retry "${RETRY_TIMES:-2}" --retry-delay "${RETRY_SLEEP:-5}" --retry-all-errors)
 if [ -n "${HEADER:-}" ]; then
   IFS=';' read -ra hs <<< "$HEADER"
   for h in "${hs[@]}"; do

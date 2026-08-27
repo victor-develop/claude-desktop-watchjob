@@ -81,6 +81,14 @@ cat > "$STUB/slackcli" <<'STUBEOF'
 #   conversations read  0.9+：人名在顶层 users[]，消息体里只有 user id；
 #                       另外 CLI 会先往 stdout 打一行进度，模板必须掐掉它才是合法 JSON
 #   messages            0.7 及更早：消息体自带 user_name，没有 users[]
+# STUB_FAIL_FILE 指向一个还不存在的路径时，第一次调用先失败并创建它，之后正常返回。
+# 用来测「一次抖动不该打死循环」的重试。
+[ -n "${STUB_SLACK_ALWAYS_FAIL:-}" ] && { echo "network unreachable" >&2; exit 1; }
+if [ -n "${STUB_FAIL_FILE:-}" ] && [ ! -f "$STUB_FAIL_FILE" ]; then
+  : > "$STUB_FAIL_FILE"
+  echo "transient network error" >&2
+  exit 1
+fi
 case "$1" in
   conversations)
     # STUB_SLACK_LEGACY=1 模拟只认旧子命令的老 CLI，用来测模板的回退分支
@@ -110,6 +118,8 @@ esac
 STUBEOF
 chmod +x "$STUB/gh" "$STUB/slackcli"
 export PATH="$STUB:$PATH"
+# 失败路径的用例本来就要走完重试才报错。测试里不需要等真实退避，压到 1 次、不睡。
+export RETRY_TIMES=1 RETRY_SLEEP=0
 
 # ---------- 1. 语法 ----------
 echo "== 语法 =="
@@ -182,6 +192,14 @@ eq "人名取自 users[]" "$(echo "$OUT" | jq -r '.[0].who')" "Alice Example"
 OUT_LEGACY=$(STUB_SLACK_LEGACY=1 "$T_DIR/probe-slack-thread.sh")
 eq "老 CLI 回退可用"   "$(echo "$OUT_LEGACY" | jq 'length')" "1"
 eq "回退时用 user_name" "$(echo "$OUT_LEGACY" | jq -r '.[0].who')" "alice"
+
+# 取数抖一次就把循环打死的话，每次抖动都要花一次唤醒去重启它 —— 重试掉这一类失败
+FAIL_ONCE="$T/slack-failed-once"
+OUT_RETRY=$(STUB_FAIL_FILE="$FAIL_ONCE" RETRY_TIMES=2 RETRY_SLEEP=0 "$T_DIR/probe-slack-thread.sh")
+eq "抖一次能重试回来" "$(echo "$OUT_RETRY" | jq 'length')" "1"
+# 一直失败仍然要失败，不能被重试吞掉
+STUB_SLACK_ALWAYS_FAIL=1 RETRY_TIMES=2 RETRY_SLEEP=0 "$T_DIR/probe-slack-thread.sh" >/dev/null 2>&1
+eq "一直失败仍 exit 3" "$?" "3"
 eq "ts 当游标"     "$(echo "$OUT" | jq -r '.[0].at')" "1767261600.000100"
 
 echo "== TERMINATE_RE 命中 → 标成 terminal =="

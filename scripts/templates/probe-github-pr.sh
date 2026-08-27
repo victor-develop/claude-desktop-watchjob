@@ -40,7 +40,7 @@ BODY_MAX="${BODY_MAX:-280}"
 case "$BODY_MAX" in ''|*[!0-9]*) echo "BODY_MAX 必须是非负整数,收到: '$BODY_MAX'" >&2; exit 2 ;; esac
 
 # 先判终止 —— PR 已经关掉就没必要再翻评论
-STATE=$(run_with_timeout "$TIMEOUT" gh pr view "$PR" --repo "$REPO" --json state --jq .state 2>/dev/null)
+STATE=$(fetch_with_retry "$TIMEOUT" gh pr view "$PR" --repo "$REPO" --json state --jq .state 2>/dev/null)
 [ -z "$STATE" ] && { echo "gh pr view 拿不到状态(超时/无权限/PR 不存在): $REPO#$PR" >&2; exit 3; }
 
 if [ "$STATE" = "MERGED" ] || [ "$STATE" = "CLOSED" ]; then
@@ -57,7 +57,7 @@ fetch() {  # $1=人话描述  其余=gh 参数
   local out rc
   local err
   err=$(mktemp)
-  out=$(run_with_timeout "$TIMEOUT" gh "$@" 2>"$err"); rc=$?
+  out=$(fetch_with_retry "$TIMEOUT" gh "$@" 2>"$err"); rc=$?
   if [ $rc -ne 0 ]; then
     echo "拉取失败(rc=$rc): $label。可能是超时(当前 TIMEOUT=${TIMEOUT}s)、限流或权限。" >&2
     # gh 的原话才是能拿来修的东西(限流 vs 404 vs token 过期)。循环会把它追加进 log

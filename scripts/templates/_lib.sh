@@ -1,10 +1,11 @@
 #!/bin/bash
 # 模板共用小库。被 probe-*.sh source。
 #
-# 提供四样:
+# 提供五样:
 #   require_bin CMD...  —— 缺命令时点名报错,并给安装地址
 #   require_env NAME... —— 缺参数时清晰报错退出(会变成循环的 exit 12,详情进 log)
 #   run_with_timeout S cmd... —— 可移植超时。macOS 默认没有 timeout(1),没有就用看门狗兜底
+#   fetch_with_retry S cmd... —— 在上面基础上重试,专治一次性网络抖动
 #   default_bot_re —— 常见 bot 账号的正则,可用 BOT_RE 覆盖
 
 # 追加而不是前置:调用方自己的 PATH 优先,标准路径只当兜底
@@ -57,6 +58,33 @@ run_with_timeout() {
   kill "$wd" 2>/dev/null
   cat "$tmp"; rm -f "$tmp"
   return $rc
+}
+
+# 一次网络抖动不该把整个循环打死。probe 失败 = 循环 exit 12 = 唤醒 agent 让它来修,
+# 而唤醒是这套机制里唯一贵的东西 —— 为一次瞬时失败付这个代价不划算。
+#
+# 重试只在「取数失败」这一步做,不碰游标:拿不到数据就重试,拿到了才往下走。所以重试
+# 不会让循环静默跳过事件,只是不为抖动叫醒你。真正的坏配置(token 过期、频道 ID 写错)
+# 每次都失败,重试完照样 exit 12,该报的还是会报,只是晚 RETRY_SLEEP*N 秒。
+#
+# 次数与间隔可用 RETRY_TIMES / RETRY_SLEEP 覆盖;默认 3 次、间隔 5 秒。
+fetch_with_retry() {
+  local secs="$1"; shift
+  local times="${RETRY_TIMES:-3}" gap="${RETRY_SLEEP:-5}"
+  local attempt=1 out rc
+  while :; do
+    out=$(run_with_timeout "$secs" "$@"); rc=$?
+    if [ $rc -eq 0 ] && [ -n "$out" ]; then
+      printf '%s' "$out"
+      return 0
+    fi
+    [ "$attempt" -ge "$times" ] && break
+    echo "取数失败(rc=$rc),第 $attempt/$times 次,${gap}s 后重试: $1" >&2
+    sleep "$gap"
+    attempt=$((attempt + 1))
+  done
+  printf '%s' "$out"
+  return "${rc:-1}"
 }
 
 # `[bot]` 后缀覆盖了 GitHub App;web-flow 是 GitHub 网页端 merge commit 的作者

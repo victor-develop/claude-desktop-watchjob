@@ -49,13 +49,13 @@ TERMINATE_RE="${TERMINATE_RE:-}"
 json_only() { sed -n '/^[[{]/,$p'; }
 
 # 新版(0.9+)
-RAW=$(run_with_timeout "$TIMEOUT" slackcli conversations read "$CHANNEL" \
+RAW=$(fetch_with_retry "$TIMEOUT" slackcli conversations read "$CHANNEL" \
         --thread-ts "$THREAD_TS" --limit "$LIMIT" --json 2>/dev/null | json_only)
 rc=$?
 
 # 旧版(0.7 及更早)
 if [ $rc -ne 0 ] || [ -z "$RAW" ]; then
-  RAW=$(run_with_timeout "$TIMEOUT" slackcli messages \
+  RAW=$(fetch_with_retry "$TIMEOUT" slackcli messages \
           --channel "$CHANNEL" --thread "$THREAD_TS" --json 2>/dev/null | json_only)
   rc=$?
 fi
