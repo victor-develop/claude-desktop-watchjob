@@ -32,8 +32,18 @@
 # CLI 会把进度行("- Fetching messages...")打到 stdout,JSON 从第一个 { 开始,所以下面
 # 先用 sed 掐掉前面的非 JSON 行。
 #
-# **本模板不分页。** GitHub 侧每个 endpoint 都带 --paginate,这里只取一次。thread 长到
-# 超过 LIMIT 时会静默截断 —— 更长的 thread 请照着 slackcli 的分页参数自己改写。
+# **本模板不分页,但这对 watch 无害。** GitHub 侧每个 endpoint 都带 --paginate,这里只取
+# 一次。thread 回复数超过 LIMIT 时 slackcli 会截断,**丢的是最旧的那头,最新的 LIMIT 条
+# 一定在返回集里** —— 所以按 ts 做游标的增量判断不会漏醒。
+# (2026-09-17 实测:一条 115 条回复的 thread,--limit 100 返回 101 条,缺的正是最早的 15 条;
+#  --limit 200 和 500 都返回完整的 116 条。)
+#
+# 只有一种情况要调大 LIMIT:你想要的是**完整历史**而不是增量(比如首次 --seed 想把整条
+# thread 存进游标,或者要回溯统计)。那就把 LIMIT 设得比回复总数大。
+#
+# ⚠️ 顺带:**不要用「消息条数变了没」来判断有没有新消息**。在超过 LIMIT 的长 thread 上
+# 条数会恒等于 LIMIT+1,永远不变 —— 这种 watch 不是偶尔漏,是永远不会醒。本模板用 ts
+# 游标就是为了避开这个。
 
 set -uo pipefail
 . "$(dirname "$0")/_lib.sh"
