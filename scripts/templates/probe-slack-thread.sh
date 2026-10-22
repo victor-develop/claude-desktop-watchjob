@@ -13,6 +13,11 @@
 #   BODY_MAX    可选  正文截断长度,默认 280
 #   LIMIT       可选  一次取多少条,默认 100
 #   TERMINATE_RE 可选 正则;某条回复命中就报 terminal(比如 '结了|closed|done')
+#   AGENT_MARK  可选  agent 用你本人账号发言时,它每条消息开头带的固定前缀(如 '[ 🤖 agent ]')。
+#               配了之后,SELF 发的消息只滤掉带前缀的那些,你本人手打的照样会叫醒 agent。
+#               别人的消息即使引用了带前缀的话也不会被滤
+#   AGENT_MARK_RE 可选 同上,但按正则匹配。Slack 会把发出去的 emoji 存成 :shortcode:,
+#               前缀里有 emoji 时用它,比如 '^\[ (:dog:|🐶) agent\]'
 #
 # 用法:
 #   export CHANNEL=C0XXXXXXXXX THREAD_TS=1700000000.000000 SELF=U0XXXXXXXXX
@@ -68,7 +73,9 @@ TERMINATE_RE="${TERMINATE_RE:-}"
 
 # 掐头也要掐尾:CLI 偶尔会在 JSON 后面追一段 "Update available: ..." 的升级提示,
 # 只掐头的话那段会把 jq 搞崩(不是每次都出现,所以是偶发崩)。
-json_only() { sed -n '/^[[{]/,/^[]}]/p'; }
+json_only() {  # 从第一行 { 或 [ 开头的起,到最后一行以 } 或 ] 结尾的止;紧凑排版的 JSON 中间也可能有以 ] 开头的行
+  awk '!s && /^[[{]/ {s=1} s {buf[++n]=$0; if ($0 ~ /[]}][[:space:]]*$/) last=n} END {for (i=1; i<=last; i++) print buf[i]}'
+}
 
 MAX_PAGES="${MAX_PAGES:-20}"
 
@@ -85,7 +92,12 @@ done
 NORMALIZE_JQ='
   ( [ (.users // [])[] | {key: .id, value: (.real_name // .name)} ] | from_entries ) as $names
   | [ .messages[]
-      | select(.user != $self)
+      | select(.user != $self
+               or (($mark != "" or $markre != "")
+                   and ((.text // "") as $t
+                        | (($mark != "" and ($t | startswith($mark)))
+                           or ($markre != "" and ($t | test($markre))))
+                        | not)))
       | select(.bot_id == null)
       | select((.subtype // "") == "")          # 滤掉 join/leave/pin 这类系统消息
       | {id: .ts,
@@ -125,7 +137,7 @@ while :; do
   fi
   count=$(printf '%s' "$RAW" | jq '.messages | length') \
     || { echo "slackcli 输出结构不符合预期,先手跑一次确认字段名" >&2; exit 3; }
-  page_items=$(printf '%s' "$RAW" | jq -c --arg self "$SELF" --argjson max "$BODY_MAX" "$NORMALIZE_JQ") \
+  page_items=$(printf '%s' "$RAW" | jq -c --arg self "$SELF" --arg mark "${AGENT_MARK:-}" --arg markre "${AGENT_MARK_RE:-}" --argjson max "$BODY_MAX" "$NORMALIZE_JQ") \
     || { echo "slackcli 输出结构不符合预期,先手跑一次确认字段名" >&2; exit 3; }
   PAGES=$(jq -cn --argjson a "$PAGES" --argjson b "$page_items" '$a + $b')
   [ "$count" -lt "$LIMIT" ] && break              # 不满一页 = 到底了
@@ -151,7 +163,7 @@ if [ "$newmode" = "0" ]; then
     echo "旧版 slackcli 不支持翻页,本次返回已达 LIMIT=$LIMIT 条,无法确认读完 —— 拒绝返回不完整结果,游标保持不动。升级 slackcli 或调大 LIMIT" >&2
     exit 3
   fi
-  PAGES=$(printf '%s' "$RAW" | jq -c --arg self "$SELF" --argjson max "$BODY_MAX" "$NORMALIZE_JQ") \
+  PAGES=$(printf '%s' "$RAW" | jq -c --arg self "$SELF" --arg mark "${AGENT_MARK:-}" --arg markre "${AGENT_MARK_RE:-}" --argjson max "$BODY_MAX" "$NORMALIZE_JQ") \
     || { echo "slackcli 输出结构不符合预期,先手跑一次确认字段名" >&2; exit 3; }
 fi
 

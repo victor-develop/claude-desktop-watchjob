@@ -154,7 +154,7 @@ judgment call.
 ```bash
 ./tests/test-exit-codes.sh      # 28 assertions: exit-code contract, cursor, inbox safety
 ./tests/test-parallel.sh 5      #  8 assertions: N loops stay isolated
-./tests/test-templates.sh       # 53 assertions: template filtering, pagination, failure propagation
+./tests/test-templates.sh       # 64 assertions: template filtering, pagination, failure propagation
 ```
 
 None of them touch the network — `gh` and `slackcli` are replaced by stubs on `PATH`, and the

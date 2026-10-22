@@ -64,7 +64,9 @@ TERMINATE_RE="${TERMINATE_RE:-}"
 
 # 掐头也要掐尾:CLI 偶尔会在 JSON 后面追一段 "Update available: ..." 的升级提示,
 # 只掐头的话那段会把 jq 搞崩(不是每次都出现,所以是偶发崩)。
-json_only() { sed -n '/^[[{]/,/^[]}]/p'; }
+json_only() {  # 从第一行 { 或 [ 开头的起,到最后一行以 } 或 ] 结尾的止;紧凑排版的 JSON 中间也可能有以 ] 开头的行
+  awk '!s && /^[[{]/ {s=1} s {buf[++n]=$0; if ($0 ~ /[]}][[:space:]]*$/) last=n} END {for (i=1; i<=last; i++) print buf[i]}'
+}
 
 MAX_PAGES="${MAX_PAGES:-20}"
 

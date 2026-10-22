@@ -83,6 +83,8 @@ cat > "$STUB/slackcli" <<'STUBEOF'
 #   messages            0.7 及更早：消息体自带 user_name，没有 users[]
 # STUB_FAIL_FILE 指向一个还不存在的路径时，第一次调用先失败并创建它，之后正常返回。
 # 用来测「一次抖动不该打死循环」的重试。
+# 模板启动时会查版本，只放行验证过的 0.7.x / 0.9.x
+[ "$1" = "--version" ] && { echo "slackcli 0.9.0"; exit 0; }
 [ -n "${STUB_SLACK_ALWAYS_FAIL:-}" ] && { echo "network unreachable" >&2; exit 1; }
 # 正常退出但没有输出：模板该立刻判空，而不是重试到超时
 [ -n "${STUB_SLACK_EMPTY:-}" ] && exit 0

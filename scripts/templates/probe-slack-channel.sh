@@ -97,7 +97,9 @@ case "${EXCLUDE_REPLIES:-0}" in
   *) echo "EXCLUDE_REPLIES 只接受 0/1,收到: '${EXCLUDE_REPLIES}'" >&2; exit 3 ;;
 esac
 
-json_only() { sed -n '/^[[{]/,/^[]}]/p'; }
+json_only() {  # 从第一行 { 或 [ 开头的起,到最后一行以 } 或 ] 结尾的止;紧凑排版的 JSON 中间也可能有以 ] 开头的行
+  awk '!s && /^[[{]/ {s=1} s {buf[++n]=$0; if ($0 ~ /[]}][[:space:]]*$/) last=n} END {for (i=1; i<=last; i++) print buf[i]}'
+}
 
 # 数值配置必须先校验:非数字的 MAX_PAGES 会让 -gt 比较每轮报错返回假,翻页上限静默失效,
 # fail-closed 路径整个绕过;LIMIT 非数字则「取满一页」的判断同样失真。启动前挡住,exit 3
