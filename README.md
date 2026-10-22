@@ -76,8 +76,15 @@ scripts/watch-loop.sh --name pr-123 --probe scripts/templates/probe-github-pr.sh
 | `probe-github-pr.sh` | PR comments, inline review comments, review verdicts; terminal on merge/close | `REPO` `PR` `SELF` |
 | `probe-github-checks.sh` | CI reaching a terminal state — green, red, cancelled or timed-out all wake you, in-flight doesn't | `REPO` `PR` |
 | `probe-slack-thread.sh` | replies in one thread | `CHANNEL` `THREAD_TS` `SELF` |
+| `probe-slack-channel.sh` | new messages in a channel or DM (not scoped to one thread) | `CHANNEL` `SELF` |
 | `probe-pr-and-slack.sh` | both of the above as a *single* watch | `REPO` `PR` `GITHUB_SELF` `CHANNEL` `THREAD_TS` `SLACK_SELF` |
 | `probe-http-json.sh` | any endpoint returning a JSON list | `URL` `MAP` |
+
+Pick `probe-slack-channel.sh` for a channel and **always for a DM**: people usually reply
+inline in a DM rather than opening a thread, so the thread template would report "no
+change" forever. It covers thread replies too by default (`EXCLUDE_REPLIES=1` limits it to
+top-level messages). Both templates use the Slack `ts` as the cursor and emit the same item
+shape, so you can swap one for the other without re-seeding.
 
 The Slack template supports both slackcli command shapes, trying them in order and only
 falling back if the first fails: `slackcli conversations read <channel> --thread-ts <ts>`

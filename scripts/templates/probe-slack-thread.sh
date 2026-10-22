@@ -32,14 +32,14 @@
 # CLI 会把进度行("- Fetching messages...")打到 stdout,JSON 从第一个 { 开始,所以下面
 # 先用 sed 掐掉前面的非 JSON 行。
 #
-# **本模板不分页,但这对 watch 无害。** GitHub 侧每个 endpoint 都带 --paginate,这里只取
-# 一次。thread 回复数超过 LIMIT 时 slackcli 会截断,**丢的是最旧的那头,最新的 LIMIT 条
-# 一定在返回集里** —— 所以按 ts 做游标的增量判断不会漏醒。
-# (2026-09-17 实测:一条 115 条回复的 thread,--limit 100 返回 101 条,缺的正是最早的 15 条;
-#  --limit 200 和 500 都返回完整的 116 条。)
-#
-# 只有一种情况要调大 LIMIT:你想要的是**完整历史**而不是增量(比如首次 --seed 想把整条
-# thread 存进游标,或者要回溯统计)。那就把 LIMIT 设得比回复总数大。
+# 分页:0.9 的 conversations read 没有 cursor 翻页,但有 --oldest(时间下界),而 Slack ts
+# 在同一 thread 内严格递增 —— 取满一页(count == LIMIT)就把 oldest 推到本页最大 ts 再取,
+# 直到不满一页为止,跨页去重靠 ts 唯一。翻满 MAX_PAGES(默认 20)仍不到底、或翻页中途失败,
+# probe 整体失败(exit 3),游标保持不动 —— 宁可叫醒 agent,也不静默截断丢事件。
+# PROBE_CURSOR 长得像 Slack ts 时用作起始 oldest(单独使用本模板时如此);二合一模板把 at
+# 归一成了 ISO8601,那种场合退化为全量翻页,完整性不受影响。
+# 旧版(0.7)的 messages 子命令不支持 --oldest/--limit 翻页:返回条数达到 LIMIT 时同样
+# fail closed,提示升级或调大 LIMIT。
 #
 # ⚠️ 顺带:**不要用「消息条数变了没」来判断有没有新消息**。在超过 LIMIT 的长 thread 上
 # 条数会恒等于 LIMIT+1,永远不变 —— 这种 watch 不是偶尔漏,是永远不会醒。本模板用 ts
@@ -51,32 +51,38 @@ require_bin slackcli jq
 SELF="${SLACK_SELF:-${SELF:-}}"
 require_env CHANNEL THREAD_TS SELF
 
+# 本模板的读取与过滤行为依赖 slackcli 的输出契约,只在 0.7.x 和 0.9.x 上验证过。
+# 其它版本 fail closed:确认过输出结构没变后,用 SLACKCLI_ALLOW_UNTESTED=1 放行。
+# (jq 那段解析失败本来也会 exit 3,这里是把「版本变了」显式挡在更前面。)
+ver=$(slackcli --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1)
+case "$ver" in
+  0.7.*|0.7|0.9.*|0.9) : ;;
+  *) [ "${SLACKCLI_ALLOW_UNTESTED:-0}" = "1" ] \
+       || { echo "未验证的 slackcli 版本 '$ver'(已验证 0.7.x / 0.9.x)。手跑一次确认 JSON 输出结构后,用 SLACKCLI_ALLOW_UNTESTED=1 放行" >&2; exit 2; } ;;
+esac
+
 TIMEOUT="${TIMEOUT:-25}"
 BODY_MAX="${BODY_MAX:-280}"
 LIMIT="${LIMIT:-100}"
 TERMINATE_RE="${TERMINATE_RE:-}"
 
-json_only() { sed -n '/^[[{]/,$p'; }
+# 掐头也要掐尾:CLI 偶尔会在 JSON 后面追一段 "Update available: ..." 的升级提示,
+# 只掐头的话那段会把 jq 搞崩(不是每次都出现,所以是偶发崩)。
+json_only() { sed -n '/^[[{]/,/^[]}]/p'; }
 
-# 新版(0.9+)
-RAW=$(fetch_with_retry "$TIMEOUT" slackcli conversations read "$CHANNEL" \
-        --thread-ts "$THREAD_TS" --limit "$LIMIT" --json 2>/dev/null | json_only)
-rc=$?
+MAX_PAGES="${MAX_PAGES:-20}"
 
-# 旧版(0.7 及更早)
-if [ $rc -ne 0 ] || [ -z "$RAW" ]; then
-  RAW=$(fetch_with_retry "$TIMEOUT" slackcli messages \
-          --channel "$CHANNEL" --thread "$THREAD_TS" --json 2>/dev/null | json_only)
-  rc=$?
-fi
+# 数值配置必须先校验:非数字的 MAX_PAGES 会让 -gt 比较每轮报错返回假,翻页上限静默失效,
+# fail-closed 路径整个绕过;LIMIT 非数字则「取满一页」的判断同样失真。启动前挡住,exit 3
+for pair in "MAX_PAGES:$MAX_PAGES" "LIMIT:$LIMIT" "TIMEOUT:$TIMEOUT" "BODY_MAX:$BODY_MAX"; do
+  name=${pair%%:*}; val=${pair#*:}
+  case "$val" in
+    ''|*[!0-9]*) echo "$name 必须是正整数,收到: '$val'" >&2; exit 3 ;;
+    0) [ "$name" = "BODY_MAX" ] || { echo "$name 不能是 0" >&2; exit 3; } ;;
+  esac
+done
 
-if [ $rc -ne 0 ] || [ -z "$RAW" ]; then
-  echo "slackcli 拉取失败或超时(rc=$rc): $CHANNEL/$THREAD_TS" >&2
-  echo "手跑一次确认子命令与输出结构:slackcli conversations read $CHANNEL --thread-ts $THREAD_TS --json" >&2
-  exit 3
-fi
-
-ITEMS=$(printf '%s' "$RAW" | jq -c --arg self "$SELF" --argjson max "$BODY_MAX" '
+NORMALIZE_JQ='
   ( [ (.users // [])[] | {key: .id, value: (.real_name // .name)} ] | from_entries ) as $names
   | [ .messages[]
       | select(.user != $self)
@@ -87,7 +93,69 @@ ITEMS=$(printf '%s' "$RAW" | jq -c --arg self "$SELF" --argjson max "$BODY_MAX" 
          at: .ts,
          kind: "slack-reply",
          body: (.text // "")[0:$max]}
-    ] | sort_by(.at)') || { echo "slackcli 输出结构不符合预期,先手跑一次确认字段名" >&2; exit 3; }
+    ] | sort_by(.at)'
+
+page_read() {  # $1=oldest(空 = 不限);stdout = 本页原始 JSON
+  local args=(conversations read "$CHANNEL" --thread-ts "$THREAD_TS" --limit "$LIMIT" --json)
+  [ -n "$1" ] && args+=(--oldest "$1")
+  fetch_with_retry "$TIMEOUT" slackcli "${args[@]}" 2>/dev/null | json_only
+}
+
+oldest=""
+# 只有整串都是 <10位以上整数>.<整数> 才是 Slack ts,才能当 --oldest 用。
+# 这里必须用正则而不是 case 的 glob:glob 里 * 通吃,`[0-9]*.[0-9]*` 会把
+# "2026-09-07T11:42:45.583859Z" 这种 ISO8601 也认成 ts(二合一模板把 at 归一成 ISO
+# 之后游标就是这个形状),喂给 slackcli --oldest 直接报错,probe 挂掉 → watch 静默死。
+if [[ "${PROBE_CURSOR:-}" =~ ^[0-9]{10,}\.[0-9]+$ ]]; then
+  oldest="$PROBE_CURSOR"
+fi
+
+PAGES='[]'; pages=0; newmode=1
+while :; do
+  pages=$((pages + 1))
+  if [ "$pages" -gt "$MAX_PAGES" ]; then
+    echo "翻满 MAX_PAGES=$MAX_PAGES 页仍未到底 —— 拒绝返回不完整结果,游标保持不动。调大 LIMIT/MAX_PAGES 后重试" >&2
+    exit 3
+  fi
+  RAW=$(page_read "$oldest"); rc=$?
+  if [ $rc -ne 0 ] || [ -z "$RAW" ]; then
+    [ "$pages" -eq 1 ] && { newmode=0; break; }   # 第一页就失败 → 试旧版子命令
+    echo "翻页中途 slackcli 失败(rc=$rc,第 $pages 页)—— 拒绝返回不完整结果,游标保持不动" >&2
+    exit 3
+  fi
+  count=$(printf '%s' "$RAW" | jq '.messages | length') \
+    || { echo "slackcli 输出结构不符合预期,先手跑一次确认字段名" >&2; exit 3; }
+  page_items=$(printf '%s' "$RAW" | jq -c --arg self "$SELF" --argjson max "$BODY_MAX" "$NORMALIZE_JQ") \
+    || { echo "slackcli 输出结构不符合预期,先手跑一次确认字段名" >&2; exit 3; }
+  PAGES=$(jq -cn --argjson a "$PAGES" --argjson b "$page_items" '$a + $b')
+  [ "$count" -lt "$LIMIT" ] && break              # 不满一页 = 到底了
+  next=$(printf '%s' "$RAW" | jq -r '[.messages[].ts] | max // empty')
+  [ -n "$next" ] || break
+  [ "$next" = "$oldest" ] && break                # oldest 不前进就停,防 inclusive 语义死循环
+  oldest="$next"
+done
+
+# 旧版(0.7 及更早):单次取,无法翻页 —— 取满即视为可能截断,fail closed
+if [ "$newmode" = "0" ]; then
+  RAW=$(fetch_with_retry "$TIMEOUT" slackcli messages \
+          --channel "$CHANNEL" --thread "$THREAD_TS" --json 2>/dev/null | json_only)
+  rc=$?
+  if [ $rc -ne 0 ] || [ -z "$RAW" ]; then
+    echo "slackcli 拉取失败或超时(rc=$rc): $CHANNEL/$THREAD_TS" >&2
+    echo "手跑一次确认子命令与输出结构:slackcli conversations read $CHANNEL --thread-ts $THREAD_TS --json" >&2
+    exit 3
+  fi
+  count=$(printf '%s' "$RAW" | jq '.messages | length') \
+    || { echo "slackcli 输出结构不符合预期,先手跑一次确认字段名" >&2; exit 3; }
+  if [ "$count" -ge "$LIMIT" ]; then
+    echo "旧版 slackcli 不支持翻页,本次返回已达 LIMIT=$LIMIT 条,无法确认读完 —— 拒绝返回不完整结果,游标保持不动。升级 slackcli 或调大 LIMIT" >&2
+    exit 3
+  fi
+  PAGES=$(printf '%s' "$RAW" | jq -c --arg self "$SELF" --argjson max "$BODY_MAX" "$NORMALIZE_JQ") \
+    || { echo "slackcli 输出结构不符合预期,先手跑一次确认字段名" >&2; exit 3; }
+fi
+
+ITEMS=$(printf '%s' "$PAGES" | jq -c 'unique_by(.id) | sort_by(.at)')
 
 if [ -n "$TERMINATE_RE" ]; then
   ITEMS=$(printf '%s' "$ITEMS" | jq -c --arg re "$TERMINATE_RE" '

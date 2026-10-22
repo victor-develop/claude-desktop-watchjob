@@ -96,6 +96,22 @@ case "$1" in
     # STUB_SLACK_LEGACY=1 模拟只认旧子命令的老 CLI，用来测模板的回退分支
     [ -n "${STUB_SLACK_LEGACY:-}" ] && { echo "unknown command" >&2; exit 1; }
     echo "- Fetching messages..."
+    # STUB_SLACK_AGENT=1 追加「agent 用本人账号发言」场景的三条,只给相关用例用 ——
+    # 直接塞进基础 fixture 的话,所有按条数断言的用例都要跟着改。
+    if [ -n "${STUB_SLACK_AGENT:-}" ]; then
+      cat <<'JSON'
+{"channel_id":"C_X","message_count":7,"messages":[
+ {"ts":"1767261600.000100","user":"U_ALICE","text":"thread 里问一句"},
+ {"ts":"1767261000.000100","user":"U_ME","text":"我自己发的"},
+ {"ts":"1767261700.000100","user":"U_ME","text":"[ AGENT ] agent 用我的号发的"},
+ {"ts":"1767261750.000100","user":"U_ME","text":"[ :dog: AGENT ] emoji 被转成 shortcode 的那条"},
+ {"ts":"1767261800.000100","user":"U_ME","text":"本人手打：去把它改了"},
+ {"ts":"1767261900.000100","user":"U_ALICE","text":"[ AGENT ] 别人引用了 agent 的话再追问"}
+],"users":[{"id":"U_ALICE","name":"alice","real_name":"Alice Example"},
+           {"id":"U_ME","name":"me","real_name":"Me"}]}
+JSON
+      exit 0
+    fi
     cat <<'JSON'
 {"channel_id":"C_X","message_count":4,"messages":[
  {"ts":"1767261600.000100","user":"U_ALICE","text":"thread 里问一句"},
@@ -206,6 +222,33 @@ eq "空输出不触发重试" "$?" "3"
 STUB_SLACK_ALWAYS_FAIL=1 RETRY_TIMES=2 RETRY_SLEEP=0 "$T_DIR/probe-slack-thread.sh" >/dev/null 2>&1
 eq "一直失败仍 exit 3" "$?" "3"
 eq "ts 当游标"     "$(echo "$OUT" | jq -r '.[0].at')" "1767261600.000100"
+
+# 用本人凭证发言的 agent：按 user id 滤会把「本人手打的指令」一起吃掉 —— 那正是最不能
+# 漏的一类消息。配了 AGENT_MARK 就改成按前缀认自己。
+echo "== probe-slack-thread：AGENT_MARK 按前缀滤自己，不误伤本人手打的 =="
+OUT_MARK=$(STUB_SLACK_AGENT=1 AGENT_MARK="[ AGENT ]" "$T_DIR/probe-slack-thread.sh")
+eq "本人手打的留下来" \
+  "$(echo "$OUT_MARK" | jq -r '[.[] | select(.body | startswith("本人手打"))] | length')" "1"
+# 注意判据是「这条是不是 agent 用本人账号发的」,不是「正文有没有前缀」—— 后者会把
+# 别人引用 agent 的话也算进来,那正是上面那条用例要防的。
+eq "agent 自己发的滤掉" \
+  "$(echo "$OUT_MARK" | jq -r '[.[] | select(.body | test("agent 用我的号发的"))] | length')" "0"
+# 没配 AGENT_MARK 时保持原行为：按 user id 滤,本人的两条都不出现
+OUT_NOMARK=$(STUB_SLACK_AGENT=1 "$T_DIR/probe-slack-thread.sh")
+eq "不配则仍按 user id 滤" \
+  "$(echo "$OUT_NOMARK" | jq -r '[.[] | select(.who == "Me")] | length')" "0"
+# marker 不能单独作数:别人引用 agent 的话时正文开头也带 marker,只按 marker 认就把
+# 别人的追问一起吃掉了 —— 必须 user id 和 marker 同时命中才算「自己发的」。
+eq "别人引用带 marker 的话不会被误滤" \
+  "$(echo "$OUT_MARK" | jq -r '[.[] | select(.body | test("别人引用"))] | length')" "1"
+
+# Slack 把发出去的 emoji 存成 shortcode,字面前缀会对不上 —— 这类前缀要用正则匹配。
+echo "== probe-slack-thread：AGENT_MARK_RE 兼容 emoji / shortcode 两种形态 =="
+OUT_RE=$(STUB_SLACK_AGENT=1 AGENT_MARK_RE='^\[ (:dog:|🐶) AGENT \]' "$T_DIR/probe-slack-thread.sh")
+eq "shortcode 形态也认得出是自己发的" \
+  "$(echo "$OUT_RE" | jq -r '[.[] | select(.body | test("shortcode 的那条"))] | length')" "0"
+eq "字面前缀对 shortcode 无效(所以要有 _RE)" \
+  "$(STUB_SLACK_AGENT=1 AGENT_MARK='[ 🐶 AGENT ]' "$T_DIR/probe-slack-thread.sh" | jq -r '[.[] | select(.body | test("shortcode 的那条"))] | length')" "1"
 
 echo "== TERMINATE_RE 命中 → 标成 terminal =="
 eq "命中" "$(TERMINATE_RE='问一句' "$T_DIR/probe-slack-thread.sh" | jq -r '.[0].kind')" "terminal"

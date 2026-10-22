@@ -51,8 +51,20 @@ probe 是一个可执行脚本,唯一职责:**把当前状态压成一个 JSON �
 | `probe-github-pr.sh` | PR 评论 + inline review + review 状态;merge/close 收尾 | `REPO` `PR` `SELF` |
 | `probe-github-checks.sh` | CI 跑完(绿了红了都叫,中间态不叫) | `REPO` `PR` |
 | `probe-slack-thread.sh` | 一条 thread 的回复 | `CHANNEL` `THREAD_TS` `SELF` |
+| `probe-slack-channel.sh` | 一个频道 / DM 里的新消息(不限 thread) | `CHANNEL` `SELF` |
 | `probe-pr-and-slack.sh` | 上面两个合成**一个** watch | `REPO` `PR` `GITHUB_SELF` `CHANNEL` `THREAD_TS` `SLACK_SELF` |
 | `probe-http-json.sh` | 任意返回 JSON 列表的接口 | `URL` `MAP` |
+
+**两个 Slack 模板怎么选:**
+
+- 盯一条 PR 讨论 / 一条已经开起来的 thread → `probe-slack-thread.sh`
+- 盯一个频道,或者盯 DM → `probe-slack-channel.sh`
+- **DM 一律用 channel 版。** 私聊里大家习惯直接回,不开 thread;用 thread 版盯自己那条
+  消息的 `thread_ts`,对方在 DM 里直接回你就永远收不到,watch 一路报「无变化」
+  (2026-09-22 真踩过一次,最后是人来提醒才发现)
+- channel 版默认**也包含** thread 里的回复,所以「对方开不开 thread」这个不确定性它都
+  兜住了;只要顶层消息就 `EXCLUDE_REPLIES=1`
+- 两个模板的游标都是 Slack ts、inbox 项形状也一样,换模板不用重新 seed
 
 配置全走环境变量,直接把模板当 `--probe` 用,不用改文件。变量从启动 `watch-loop.sh` 的
 shell 继承,所以要在同一条命令里 export。每个模板顶部注释是完整用法。
@@ -70,17 +82,37 @@ scripts/watch-loop.sh --name <名字> --probe <probe路径> --seed
 
 不 seed 的话首轮会把全部历史当成新增,白叫醒你一次。
 
-### 3. 启动循环
+### 3. 启动循环(默认:守护模式,跑 3 天)
 
-用 Bash 工具,`run_in_background: true`:
+Claude Code 的后台 Bash 最多活 **2 小时**(`timeout` 上限 7200000ms),到点被 harness 直接杀掉
+(状态是 killed,不是 exit 13,锁也不释放)。要盯几天的东西,循环就不能挂在 harness 下面。
+所以默认拆两半:
+
+1. **轮询循环用 nohup 脱离 harness 跑**,加 `--daemon`。`--max-runtime` 默认 259200(3 天)。
+   守护模式下有新增项只写 inbox、刷新 `wake`,**不退出**,接着轮询;probe 出错也只记 signal、
+   下一轮重试,连续失败 3 次才叫醒 agent(`WATCH_DAEMON_FAIL_ALERT` 可调)。所以处理完 inbox **不用重启循环**,游标一直连续,不会出现「重启那几分钟没人盯」的空档。
+   它也不随 app 退出而死(app 重启后只需要重挂第 2 步)
+2. **叫醒器 `watch-wait.sh` 用 `run_in_background` 挂在 harness 下**,只读本地文件。一个叫醒器
+   可以同时等多个循环(`--name` 可重复)
 
 ```bash
-export REPO=owner/repo PR=1234 SELF=your-login
-~/.claude/skills/incremental-watch/scripts/watch-loop.sh \
-  --name pr-1234 \
-  --probe ~/.claude/skills/incremental-watch/scripts/templates/probe-github-pr.sh \
-  --interval 120 --max-runtime 5400
+# ① 守护循环(nohup + & disown;环境变量写在同一行)
+REPO=owner/repo PR=1234 SELF=your-login \
+  nohup ~/.claude/skills/incremental-watch/scripts/watch-loop.sh \
+    --name pr-1234 \
+    --probe ~/.claude/skills/incremental-watch/scripts/templates/probe-github-pr.sh \
+    --interval 120 --daemon >/dev/null 2>&1 & disown
+
+# ② 叫醒器 —— Bash 工具 run_in_background: true, timeout: 7200000
+~/.claude/skills/incremental-watch/scripts/watch-wait.sh --name pr-1234 [--name 另一个] --timeout 6600
 ```
+
+叫醒器退出码:10 有新增项(处理完把 inbox 写成 `[]`,**只重挂叫醒器**);11 terminal(收尾,
+`kill` 掉守护循环);12 probe 出错(循环还活着会重试,看一眼 detail 再重挂叫醒器);13 等满
+`--timeout`(原样重挂叫醒器,不用汇报);14 守护循环死了(看 log,修好后重新 nohup 拉起)。
+
+不需要跑那么久、几十分钟就有结论的(等 CI、等部署),也可以照旧不加 `--daemon`、直接
+`run_in_background` 跑 `watch-loop.sh`,`--max-runtime` 给到 ≤6400(留出余量,不然会被 2 小时上限杀掉)。
 
 启动后告诉用户三件事:盯的是什么、多久查一次、什么情况会叫醒你。别让人猜。
 
@@ -143,16 +175,16 @@ harness 的通知里带退出码。状态目录 `~/.claude/watch/<name>/` 里有
   东西用 1800s + `--backoff`
 - `--backoff`:连续无事时间隔翻倍(上限 8 倍)。低频源用它,能少跑很多次 probe。
   代价是刚有动静时可能慢一拍
-- `--max-runtime`:默认 90 分钟。到点退出 13 让你重新拉起,顺便给你一个「这事还没完」
-  的检查点。长盯的场景可以调大,但别取消 —— 一个永不退出的后台循环没人知道它还活着
+- `--max-runtime`:默认 3 天(259200)。守护模式下靠它给循环一个寿命上限,到点退出、叫醒器报 14。
+  **不加 `--daemon` 直接挂在 harness 下时必须 ≤6400**:后台 Bash 最多 7200 秒,超了会被直接杀掉
 - `--active` / `--active-days`:只在工作时段轮询。注意它**只压 probe 次数,不压 max-runtime
   唤醒** —— 计时不看活动窗口,跨夜跑照样会在跑满时 exit 13 把你叫起来。真要过夜省钱,
   把 `--max-runtime` 调大
 
 ## 局限
 
-- **app 退出会带走后台循环。** 它是 claude 进程的子进程。用户重启 app 之后需要重新拉起,
-  循环自己不知道这件事
+- **app 退出会带走叫醒器,守护循环不受影响。** 用户重启 app 之后只要重挂 `watch-wait.sh`;
+  不加 `--daemon`、直接挂在 harness 下的循环会跟着 app 一起死,需要重新拉起
 - **一个 name 只能有一个循环。** 脚本用目录锁保证;同名启动时若旧循环还活着就退出 1,
   旧循环已死则接管过期锁
 - **不要用它盯 harness 自己就能通知你的东西。** 后台任务、subagent 完成时你本来就会被
@@ -161,9 +193,10 @@ harness 的通知里带退出码。状态目录 `~/.claude/watch/<name>/` 里有
 
 ## 文件
 
-- `scripts/watch-loop.sh` —— 通用循环。游标、inbox 合并去重、锁、退出码、活动窗口都在里面
-- `scripts/templates/` —— 现成 probe(GitHub PR / CI checks / Slack thread / PR+Slack 合并 /
-  HTTP JSON),配置走环境变量,直接可用。`_lib.sh` 里有 `require_env` 和 `run_with_timeout`
+- `scripts/watch-loop.sh` —— 通用循环。游标、inbox 合并去重、锁、退出码、活动窗口、守护模式都在里面
+- `scripts/watch-wait.sh` —— 守护模式的叫醒器:只读本地文件,有事就退出叫醒 agent,一个可以等多个循环
+- `scripts/templates/` —— 现成 probe(GitHub PR / CI checks / Slack thread / Slack 频道·DM /
+  PR+Slack 合并 / HTTP JSON),配置走环境变量,直接可用。`_lib.sh` 里有 `require_env` 和 `run_with_timeout`
 - `references/sources.md` —— 怎么挑模板、怎么自己写一个
 - `references/mechanics.md` —— 这个形状是怎么试出来的:实测过的平台行为、以及 cron 和
   scheduled-task 两条路为什么走不通。改动 `watch-loop.sh` 之前先读这个,免得重踩

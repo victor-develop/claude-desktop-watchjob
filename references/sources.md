@@ -10,8 +10,14 @@ probe 的唯一职责:**把当前状态压成一个 JSON 数组**,每项带一�
 | `probe-github-pr.sh` | PR 的评论 + inline review + review 状态;merge/close 时收尾 | `REPO` `PR` `SELF` |
 | `probe-github-checks.sh` | CI 跑完没,绿了红了都叫你;中间态不叫 | `REPO` `PR` |
 | `probe-slack-thread.sh` | 一条 thread 的回复 | `CHANNEL` `THREAD_TS` `SELF` |
+| `probe-slack-channel.sh` | 一个频道 / DM 里的新消息(不限 thread) | `CHANNEL` `SELF` |
 | `probe-pr-and-slack.sh` | 上面两个合成一个 watch(见下) | `REPO` `PR` `GITHUB_SELF` `CHANNEL` `THREAD_TS` `SLACK_SELF` |
 | `probe-http-json.sh` | 任意返回 JSON 列表的接口 | `URL` `MAP` |
+
+两个 Slack 模板的分工:thread 版只看 `THREAD_TS` 底下的回复,channel 版看整个会话
+(顶层消息 + thread 回复,`EXCLUDE_REPLIES=1` 可以只要顶层)。**盯 DM 用 channel 版** ——
+私聊里对方通常直接回、不开 thread,thread 版会一路报「无变化」。两者游标同为 Slack ts、
+inbox 项形状一致,可以互换。channel 版只验证过 slackcli 0.9.x,不做 0.7 回退。
 
 `probe-slack-thread.sh` 兼容两种 slackcli 命令形状,按顺序尝试、只有第一种失败才试第二种:
 

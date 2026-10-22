@@ -9,12 +9,23 @@
 #
 # 选项:
 #   --interval N        轮询间隔秒,默认 120
-#   --max-runtime N     最长跑多久(秒),到点退出 13 让 agent 重新拉起,默认 5400(90min)
+#   --max-runtime N     最长跑多久(秒),到点退出 13 让 agent 重新拉起,默认 259200(3 天)。
+#                       注意 Claude Code 的后台 Bash 最多活 2 小时(timeout 上限 7200000ms),
+#                       要跑满 3 天必须配 --daemon 脱离 harness 跑,见下
+#   --daemon            守护模式:有新增项只写 inbox + 刷新 <state>/wake,不退出,继续轮询;
+#                       probe 出错只记 log、下一轮重试,连续失败 3 次(WATCH_DAEMON_FAIL_ALERT)才写 signal + 刷新 wake。用 nohup 脱离 harness 启动,
+#                       再用 watch-wait.sh(run_in_background)等 wake 叫醒 agent
 #   --backoff           连续无事时间隔翻倍,上限 interval*8。适合低频源
 #   --active HH-HH      只在这个小时区间内轮询,窗口外空转(不算轮次),如 10-18
 #   --active-days D-D   只在这些星期内轮询(1=周一),如 1-5
 #   --seed              只把游标对齐到当前最新,然后退出 0。装 watch 的第一步
-#   --state-dir DIR     状态目录,默认 ~/.claude/watch/<name>
+#   --state-dir DIR     状态目录,默认 ~/.claude/watch/<name>。显式给这个参数 = 你确认
+#                       该目录可以被本脚本写入和清理
+#
+# --name 必须是单个路径组件(字母数字开头,只含 [A-Za-z0-9._-]):它拼进状态目录路径,
+# 脚本会往里写文件、递归删 lock,带 / 或 .. 的名字会被拒绝。
+# 游标存两个文件:cursor(最新 at)+ cursor_ids(at 恰好等于游标的已见条目键)——
+# 秒级时间戳下同秒晚到的条目靠后者去重投递,不会被 > 比较永久漏掉。
 #
 # probe 脚本的约定:
 #   · 环境变量 PROBE_CURSOR 是当前游标(首次为空)
@@ -38,7 +49,7 @@ set -uo pipefail
 # 追加而不是前置 —— 调用方指定的 PATH 优先
 export PATH="$PATH:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
-NAME=""; PROBE=""; INTERVAL=120; MAX_RUNTIME=5400; BACKOFF=0
+NAME=""; PROBE=""; INTERVAL=120; MAX_RUNTIME=259200; BACKOFF=0; DAEMON=0
 ACTIVE_HOURS=""; ACTIVE_DAYS=""; SEED=0; STATE_DIR=""
 
 while [ $# -gt 0 ]; do
@@ -48,6 +59,7 @@ while [ $# -gt 0 ]; do
     --interval)    INTERVAL="$2"; shift 2 ;;
     --max-runtime) MAX_RUNTIME="$2"; shift 2 ;;
     --backoff)     BACKOFF=1; shift ;;
+    --daemon)      DAEMON=1; shift ;;
     --active)      ACTIVE_HOURS="$2"; shift 2 ;;
     --active-days) ACTIVE_DAYS="$2"; shift 2 ;;
     --seed)        SEED=1; shift ;;
@@ -73,15 +85,23 @@ done
 [ -n "$PROBE" ] || { echo "--probe required" >&2; exit 1; }
 [ -x "$PROBE" ] || { echo "probe not executable: $PROBE" >&2; exit 1; }
 
+# NAME 会拼进状态目录路径,而脚本会往里写文件、递归删 lock —— 必须是单个安全的路径组件,
+# 否则 --name '../../x' 能把写入和删除逃逸到任意目录
+[[ "$NAME" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] \
+  || { echo "--name 必须是字母数字开头、只含 [A-Za-z0-9._-] 的单个路径组件(≤64 字符),收到: '$NAME'" >&2; exit 1; }
+
 STATE_DIR="${STATE_DIR:-$HOME/.claude/watch/$NAME}"
 mkdir -p "$STATE_DIR"
-CURSOR_F="$STATE_DIR/cursor"; INBOX="$STATE_DIR/inbox.json"
+CURSOR_F="$STATE_DIR/cursor"; CURSOR_IDS="$STATE_DIR/cursor_ids"; INBOX="$STATE_DIR/inbox.json"
 SIGNAL="$STATE_DIR/signal.json"
-LOG="$STATE_DIR/log"; LOCK="$STATE_DIR/lock"; META="$STATE_DIR/meta.json"
+LOG="$STATE_DIR/log"; LOCK="$STATE_DIR/lock"; META="$STATE_DIR/meta.json"; WAKE="$STATE_DIR/wake"
 
 log() { echo "[$(date '+%F %T')] $*" >> "$LOG"; }
 
-# 同名 watch 只允许一个循环,否则两个都在推游标、事件会互相吃掉
+# 同名 watch 只允许一个循环,否则两个都在推游标、事件会互相吃掉。
+# 接管过期锁必须原子:直接 rm -rf + mkdir 的话,两个启动者可能都判定旧 pid 已死,
+# 后到者会把先到者刚建好的锁删掉,双方并发跑起来。改用 rename(2):mv 只有一个赢家,
+# 输家回到 mkdir 竞争(同样原子),任何交错下最多一个进程持锁。
 if ! mkdir "$LOCK" 2>/dev/null; then
   holder=$(cat "$LOCK/pid" 2>/dev/null || echo "?")
   if [ "$holder" != "?" ] && kill -0 "$holder" 2>/dev/null; then
@@ -89,11 +109,24 @@ if ! mkdir "$LOCK" 2>/dev/null; then
     echo "watch '$NAME' already running (pid $holder)" >&2
     exit 1
   fi
+  # 移走前重读:上面判定死锁到这里之间,锁可能已被并发接管者换成了活锁
+  holder2=$(cat "$LOCK/pid" 2>/dev/null || echo "?")
+  if [ "$holder2" != "?" ] && kill -0 "$holder2" 2>/dev/null; then
+    echo "lock race lost (now held by live pid $holder2)" >&2; exit 1
+  fi
+  stale="$LOCK.stale.$$"
+  if mv "$LOCK" "$stale" 2>/dev/null; then rm -rf "$stale"; fi
+  mkdir "$LOCK" 2>/dev/null || { echo "lock race lost" >&2; exit 1; }
   log "接管过期锁 (原 pid $holder)"
-  rm -rf "$LOCK"; mkdir "$LOCK" 2>/dev/null || { echo "lock race lost" >&2; exit 1; }
 fi
 echo $$ > "$LOCK/pid"
-trap 'rm -rf "$LOCK"' EXIT
+# 释放只删自己的锁:长轮次结束时锁可能已被合法接管,不能连别人的一起删
+trap '[ "$(cat "$LOCK/pid" 2>/dev/null)" = "$$" ] && rm -rf "$LOCK"' EXIT
+# 写完 pid 再验一次所有权:极端交错下(慢一步的接管者刚好在上面两步之间通过了死锁判定)
+# 自己的新锁可能被移走。settle 一拍后 pid 不是自己 → 退出,让对方独占
+sleep 1
+[ "$(cat "$LOCK/pid" 2>/dev/null)" = "$$" ] \
+  || { echo "lock ownership lost right after acquire" >&2; exit 1; }
 
 # ---- 两个出口,严格分开 ----
 # inbox.json  = 真实数据项,累积、去重,只有 agent 能清空
@@ -102,6 +135,7 @@ trap 'rm -rf "$LOCK"' EXIT
 # 以及 inbox 里攒着没处理的项时被一条控制信号覆盖掉,事件永久丢失。
 emit_signal_and_exit() {  # $1=exit_code  $2=json对象
   printf '%s\n' "$2" > "$SIGNAL"
+  touch "$WAKE"
   log "exit $1 (signal), inbox 保持不动"
   exit "$1"
 }
@@ -109,8 +143,17 @@ emit_signal_and_exit() {  # $1=exit_code  $2=json对象
 emit_data_and_exit() {  # $1=exit_code  $2=json数组  $3=signal对象
   printf '%s\n' "$2" > "$INBOX"
   printf '%s\n' "$3" > "$SIGNAL"
+  touch "$WAKE"
   log "exit $1, inbox $(printf '%s' "$2" | jq -c 'length') 项"
   exit "$1"
+}
+
+# 守护模式下的「叫醒」:写 inbox / signal、刷新 wake 文件,但不退出 —— 由 watch-wait.sh 去叫 agent
+emit_data_and_continue() {  # $1=json数组  $2=signal对象
+  printf '%s\n' "$1" > "$INBOX"
+  printf '%s\n' "$2" > "$SIGNAL"
+  touch "$WAKE"
+  log "inbox $(printf '%s' "$1" | jq -c 'length') 项,已刷新 wake,继续轮询"
 }
 
 bail() {  # probe 或自身出错
@@ -147,14 +190,25 @@ run_probe() {  # stdout = items json array
 }
 
 cat > "$META" <<EOF
-{"name":"$NAME","probe":"$PROBE","interval":$INTERVAL,"max_runtime":$MAX_RUNTIME,
+{"name":"$NAME","probe":"$PROBE","interval":$INTERVAL,"max_runtime":$MAX_RUNTIME,"daemon":$DAEMON,
  "pid":$$,"started_at":"$(date -u '+%FT%TZ')"}
 EOF
+
+# 一个条目的去重键:有 id 用 id,没有用 who|at。跟下面 inbox 合并的 unique_by 保持同一套语义
+KEYX='(.id // ((.who // "") + "|" + (.at | tostring)))'
+
+# 游标是秒级时间戳时,同一秒内、拉取之后才出现的条目会满足 .at == cursor 而被 > 过滤掉,
+# 且永远不再重试。所以游标旁边存一份 cursor_ids:已见过的、at 恰好等于游标的条目键。
+# 过滤规则变成:at > cursor,或 at == cursor 且键不在 cursor_ids 里 —— 边界条目至少投递一次。
+cursor_ids_at() {  # $1=items数组 $2=at值 → 该时刻所有条目的键
+  printf '%s' "$1" | jq -c --arg l "$2" "[ .[] | select(.at == \$l) | $KEYX ]"
+}
 
 # ---- seed: 只对齐游标,不叫醒 agent ----
 if [ "$SEED" = "1" ]; then
   items=$(run_probe) || { echo "$items" >&2; bail "seed 时 probe 失败: $items"; }
   latest=$(printf '%s' "$items" | jq -r 'sort_by(.at) | .[-1].at // ""')
+  cursor_ids_at "$items" "$latest" > "$CURSOR_IDS"
   printf '%s' "$latest" > "$CURSOR_F"
   printf '[]\n' > "$INBOX"
   log "seeded cursor=$latest"
@@ -162,8 +216,8 @@ if [ "$SEED" = "1" ]; then
   exit 0
 fi
 
-log "循环启动 pid=$$ interval=${INTERVAL}s max_runtime=${MAX_RUNTIME}s backoff=$BACKOFF"
-started=$(date +%s); cur_interval=$INTERVAL
+log "循环启动 pid=$$ interval=${INTERVAL}s max_runtime=${MAX_RUNTIME}s backoff=$BACKOFF daemon=$DAEMON"
+started=$(date +%s); cur_interval=$INTERVAL; probe_fails=0; DAEMON_FAIL_ALERT=${WATCH_DAEMON_FAIL_ALERT:-3}
 
 while true; do
   now=$(date +%s)
@@ -174,11 +228,31 @@ while true; do
   fi
 
   if in_active_window; then
-    items=$(run_probe) || bail "probe 失败: $items"
+    if ! items=$(run_probe); then
+      if [ "$DAEMON" = "1" ]; then
+        # 守护模式:网络抖动不该让一个要跑 3 天的循环死掉,下一轮照常重试。单次失败只记 log;
+        # 连续失败到 DAEMON_FAIL_ALERT 次才写 signal、刷新 wake 叫醒 agent —— 偶发抖动不值得一次唤醒,
+        # 持续性故障(凭证过期、接口改了)才需要人看
+        probe_fails=$((probe_fails + 1))
+        log "probe 失败(守护模式,连续第 ${probe_fails} 次,下一轮重试): $items"
+        if [ "$probe_fails" -eq "$DAEMON_FAIL_ALERT" ]; then
+          printf '%s\n' "$(jq -n --arg d "连续 $probe_fails 次 probe 失败: $items" --arg n "$NAME" '{kind:"guard-error", watch:$n, detail:$d}')" > "$SIGNAL"
+          touch "$WAKE"
+        fi
+        sleep "$cur_interval"
+        continue
+      fi
+      bail "probe 失败: $items"
+    fi
+    probe_fails=0
 
     cursor=$(cat "$CURSOR_F" 2>/dev/null || echo "")
-    fresh=$(printf '%s' "$items" | jq --arg c "$cursor" \
-      '[ .[] | select(($c == "") or (.at > $c)) ] | sort_by(.at)')
+    seen=$(cat "$CURSOR_IDS" 2>/dev/null); [ -z "$seen" ] && seen='[]'
+    printf '%s' "$seen" | jq -e 'type == "array"' >/dev/null 2>&1 || seen='[]'
+    fresh=$(printf '%s' "$items" | jq --arg c "$cursor" --argjson seen "$seen" \
+      "[ .[] | select((\$c == \"\") or (.at > \$c)
+                     or ((.at == \$c) and ((($KEYX) as \$k | \$seen | index(\$k)) | not)))
+       ] | sort_by(.at)")
     n=$(printf '%s' "$fresh" | jq 'length')
 
     if [ "$n" -gt 0 ]; then
@@ -199,8 +273,18 @@ while true; do
       latest=$(printf '%s' "$fresh" | jq -er '.[-1].at') \
         || bail "取不到本轮最大的 at,游标不推进"
 
-      # 先落盘 inbox 再推游标 —— 顺序反了的话中途挂掉会永久丢事件
+      # 游标没动(新条目和游标同秒)时,已见键要和旧的合并 —— probe 做了服务端过滤的话,
+      # 本轮结果里可能不含之前见过的同秒条目,直接覆盖会把它们再投一遍
+      if [ "$latest" = "$cursor" ]; then
+        new_seen=$(jq -cn --argjson a "$seen" --argjson b "$(cursor_ids_at "$items" "$latest")" '$a + $b | unique')
+      else
+        new_seen=$(cursor_ids_at "$items" "$latest")
+      fi
+
+      # 先落盘 inbox,再推 cursor_ids 和游标 —— 顺序反了的话中途挂掉会永久丢事件;
+      # 现在这个顺序下中途挂掉最多重复投递,由 inbox 的 unique_by 吸收
       printf '%s\n' "$merged" > "$INBOX"
+      printf '%s\n' "$new_seen" > "$CURSOR_IDS"
       printf '%s' "$latest" > "$CURSOR_F"
 
       if printf '%s' "$fresh" | jq -e 'any(.kind == "terminal")' >/dev/null 2>&1; then
@@ -209,14 +293,22 @@ while true; do
           "$(jq -n --arg n "$NAME" '{kind:"terminal", watch:$n}')"
       fi
 
+      sig_new=$(jq -n --arg n "$NAME" --argjson c "$n" '{kind:"new-items", watch:$n, count:$c}')
+      if [ "$DAEMON" = "1" ]; then
+        emit_data_and_continue "$merged" "$sig_new"
+        cur_interval=$INTERVAL
+        sleep "$cur_interval"
+        continue
+      fi
       log "$n 项新增,唤醒 agent"
-      emit_data_and_exit 10 "$merged" \
-        "$(jq -n --arg n "$NAME" --argjson c "$n" '{kind:"new-items", watch:$n, count:$c}')"
+      emit_data_and_exit 10 "$merged" "$sig_new"
     fi
 
+    # 先睡再翻倍。顺序反了的话 --backoff 一启动就把第一轮空闲睡成 2x,用户配的
+    # --interval 从头到尾没生效过 —— 「连续无事才翻倍」里第一次空闲不算「连续」。
+    log "无变化,睡 ${cur_interval}s"
     [ "$BACKOFF" = "1" ] && [ "$cur_interval" -lt $((INTERVAL * 8)) ] \
       && cur_interval=$((cur_interval * 2))
-    log "无变化,睡 ${cur_interval}s"
   else
     log "活动窗口外,睡 ${INTERVAL}s"
     cur_interval=$INTERVAL
