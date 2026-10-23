@@ -107,7 +107,7 @@ REPO=owner/repo PR=1234 SELF=your-login \
 ~/.claude/skills/incremental-watch/scripts/watch-wait.sh --name pr-1234 [--name 另一个] --timeout 6600
 ```
 
-叫醒器退出码:10 有新增项(处理完把 inbox 写成 `[]`,**只重挂叫醒器**);11 terminal(收尾,
+叫醒器退出码:10 有新增项(处理完用 `watch-ack.sh` 删掉处理过的那几项,**只重挂叫醒器**;inbox 里还剩没处理的项时,重挂会立刻再叫醒你);11 terminal(收尾,
 `kill` 掉守护循环);12 probe 出错(循环还活着会重试,看一眼 detail 再重挂叫醒器);13 等满
 `--timeout`(原样重挂叫醒器,不用汇报);14 守护循环死了(看 log,修好后重新 nohup 拉起)。
 
@@ -121,20 +121,32 @@ REPO=owner/repo PR=1234 SELF=your-login \
 harness 的通知里带退出码。状态目录 `~/.claude/watch/<name>/` 里有两个文件,分工是硬的:
 
 - **`inbox.json`** —— 真实数据项,累积去重。循环只做 merge 追加,不会丢弃未处理项;
-  清空是你的事。唯一的例外是 `--seed`,它会把 inbox 重置成 `[]`,所以别对一个正在跑的
-  watch 重新 seed
+  删项是你的事,而且**只用 `watch-ack.sh` 删你处理过的那几项**(见下)。唯一的例外是 `--seed`,
+  它会把 inbox 重置成 `[]`,所以别对一个正在跑的 watch 重新 seed
 - **`signal.json`** —— 这次为什么退出,每次覆盖
 
 按码分支:
 
 | 码 | 含义 | 你该做什么 |
 |---|---|---|
-| 10 | 有新增项 | 读 `inbox.json` 处理。**别自己再去翻源** —— probe 已经过滤好了,重新拉一遍等于把省下的上下文又灌回来。处理完把 inbox 写成 `[]`,然后重新拉起循环 |
+| 10 | 有新增项 | 读 `inbox.json` 处理。**别自己再去翻源** —— probe 已经过滤好了,重新拉一遍等于把省下的上下文又灌回来。处理完用 `watch-ack.sh --name <名字> --ids <处理过的 id>` 删掉这几项,然后重新拉起循环(守护模式下只重挂叫醒器) |
 | 11 | 命中终止条件 | terminal 项也在 `inbox.json` 里(通常是最后一项)。收尾汇报,不要再拉起 |
 | 12 | probe 出错 | 读 `signal.json` 的 `detail` 和 `log`。**先修好再拉起**,否则每轮都叫你一次,比不省 token 更糟 |
 | 13 | 跑满 max-runtime | 没有新东西。原样重新拉起,不用汇报(除非用户在等状态) |
 
 12 和 13 不动 `inbox.json`。所以拉起之前先看一眼 inbox —— 里面可能还有上一轮没处理完的项。
+
+**处理完只删处理过的项,别把 inbox 整个写成 `[]`。** 你读 inbox、处理、清空之间可能过了几分钟,
+守护循环这期间照常往里 merge 新项;整个覆盖会把这些你还没看过的项一起抹掉,而且没有任何报错
+—— 你以为处理完了,其实漏了(实际发生过:处理一条页面评论的两分钟里又来了两条,一起被清掉)。
+
+```bash
+~/.claude/skills/incremental-watch/scripts/watch-ack.sh --name pr-1234 --ids c:2107,c:2108
+# 0 = inbox 空了;10 = 还有没点名的项(会列出来),处理完再 ack;2 = 循环正在写,过几秒重试
+```
+
+它和循环共用一把 inbox 锁,不会和循环同时读改写。退出码 10 时别急着重挂叫醒器 —— 先把列出来的
+项处理掉;就算忘了,叫醒器一挂上看到 inbox 非空也会立刻退出 10 叫你。
 
 **唤醒不是授权。** 那条通知是系统事件,不是用户说"可以了"。循环把你叫醒只意味着「有新
 信息」,不意味着你可以代用户发言、改代码、合并、部署。启动 watch 的时候就把自主边界
@@ -195,6 +207,7 @@ harness 的通知里带退出码。状态目录 `~/.claude/watch/<name>/` 里有
 
 - `scripts/watch-loop.sh` —— 通用循环。游标、inbox 合并去重、锁、退出码、活动窗口、守护模式都在里面
 - `scripts/watch-wait.sh` —— 守护模式的叫醒器:只读本地文件,有事就退出叫醒 agent,一个可以等多个循环
+- `scripts/watch-ack.sh` —— 处理完后按 id 从 inbox 删项,和循环共用 inbox 锁;`scripts/inbox-lock.sh` 是两边共用的锁和原子写
 - `scripts/templates/` —— 现成 probe(GitHub PR / CI checks / Slack thread / Slack 频道·DM /
   PR+Slack 合并 / HTTP JSON),配置走环境变量,直接可用。`_lib.sh` 里有 `require_env` 和 `run_with_timeout`
 - `references/sources.md` —— 怎么挑模板、怎么自己写一个
@@ -206,8 +219,9 @@ harness 的通知里带退出码。状态目录 `~/.claude/watch/<name>/` 里有
 | 文件 | 谁写 | 说明 |
 |---|---|---|
 | `cursor` | 循环 | 已消费到哪。**落 inbox 之后才推进**,所以中途挂掉不会丢事件 |
-| `inbox.json` | 循环 merge 追加 / **你清空** | 待处理的数据项,去重后按 `at` 排序。`--seed` 会重置它 |
+| `inbox.json` | 循环 merge 追加 / **你用 `watch-ack.sh` 删** | 待处理的数据项,去重后按 `at` 排序。`--seed` 会重置它 |
 | `signal.json` | 循环覆盖 | 这次为什么退出 |
 | `log` | 循环追加 | 每轮一行。probe 的 stderr 也在这 |
 | `meta.json` | 循环 | 启动参数和 pid |
 | `lock/` | 循环 | 目录锁,同名只允许一个循环 |
+| `inbox.lock/` | 循环 / `watch-ack.sh` | 读改写 inbox 时的短锁,只持有一瞬间;超过 30 秒视为残留自动接管 |
