@@ -109,13 +109,15 @@ one instead of failing halfway through.
 
 | Exit | Meaning | What the agent does |
 |---|---|---|
-| 10 | new items | read `inbox.json`, handle, clear it, relaunch |
+| 10 | new items | read `inbox.json`, handle, remove the handled ids with `watch-ack.sh`, relaunch |
 | 11 | terminal condition | wrap up, don't relaunch |
 | 12 | probe failed | read `signal.json` and `log`, fix before relaunching |
 | 13 | hit `--max-runtime` | nothing happened; relaunch as-is |
 
 `inbox.json` accumulates data items — the loop only ever merges into it, never discards unhandled
-entries, and clearing it is the agent's job. (`--seed` is the one exception: it resets the inbox,
+entries, and removing handled items is the agent's job — with `scripts/watch-ack.sh --ids …`, never by
+overwriting the file with `[]`: in daemon mode new items can land while you are handling the old ones,
+and a blind overwrite drops them without any error. `watch-ack.sh` shares a short lock with the loop. (`--seed` is the one exception: it resets the inbox,
 so don't re-seed a watch that is already running.) `signal.json` says why the loop exited and is
 overwritten each time. Keeping them apart matters: an earlier version wrote
 both to one file, and a control signal could overwrite unhandled items — losing events silently.
@@ -155,6 +157,7 @@ judgment call.
 ./tests/test-exit-codes.sh      # 28 assertions: exit-code contract, cursor, inbox safety
 ./tests/test-parallel.sh 5      #  8 assertions: N loops stay isolated
 ./tests/test-templates.sh       # 64 assertions: template filtering, pagination, failure propagation
+./tests/test-ack.sh             # 21 assertions: watch-ack contract, lock takeover, no lost items when racing the loop
 ```
 
 None of them touch the network — `gh` and `slackcli` are replaced by stubs on `PATH`, and the

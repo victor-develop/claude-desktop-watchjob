@@ -98,6 +98,11 @@ LOG="$STATE_DIR/log"; LOCK="$STATE_DIR/lock"; META="$STATE_DIR/meta.json"; WAKE=
 
 log() { echo "[$(date '+%F %T')] $*" >> "$LOG"; }
 
+# inbox 的锁和原子写,和 watch-ack.sh 共用一份实现
+# shellcheck source=inbox-lock.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/inbox-lock.sh"
+INBOX_LOCKED=0
+
 # 同名 watch 只允许一个循环,否则两个都在推游标、事件会互相吃掉。
 # 接管过期锁必须原子:直接 rm -rf + mkdir 的话,两个启动者可能都判定旧 pid 已死,
 # 后到者会把先到者刚建好的锁删掉,双方并发跑起来。改用 rename(2):mv 只有一个赢家,
@@ -121,7 +126,7 @@ if ! mkdir "$LOCK" 2>/dev/null; then
 fi
 echo $$ > "$LOCK/pid"
 # 释放只删自己的锁:长轮次结束时锁可能已被合法接管,不能连别人的一起删
-trap '[ "$(cat "$LOCK/pid" 2>/dev/null)" = "$$" ] && rm -rf "$LOCK"' EXIT
+trap '[ "$INBOX_LOCKED" = "1" ] && inbox_unlock "$STATE_DIR"; [ "$(cat "$LOCK/pid" 2>/dev/null)" = "$$" ] && rm -rf "$LOCK"' EXIT
 # 写完 pid 再验一次所有权:极端交错下(慢一步的接管者刚好在上面两步之间通过了死锁判定)
 # 自己的新锁可能被移走。settle 一拍后 pid 不是自己 → 退出,让对方独占
 sleep 1
@@ -129,7 +134,7 @@ sleep 1
   || { echo "lock ownership lost right after acquire" >&2; exit 1; }
 
 # ---- 两个出口,严格分开 ----
-# inbox.json  = 真实数据项,累积、去重,只有 agent 能清空
+# inbox.json  = 真实数据项,累积、去重;只有 agent 能删(用 watch-ack.sh 按 id 删),写之前都要拿 inbox 锁
 # signal.json = 这次为什么退出,每次覆盖
 # 混在一个文件里会出两种事故:控制信号被当成数据项参与下一轮合并;
 # 以及 inbox 里攒着没处理的项时被一条控制信号覆盖掉,事件永久丢失。
@@ -140,17 +145,17 @@ emit_signal_and_exit() {  # $1=exit_code  $2=json对象
   exit "$1"
 }
 
-emit_data_and_exit() {  # $1=exit_code  $2=json数组  $3=signal对象
-  printf '%s\n' "$2" > "$INBOX"
+# 这两个 emit 不再写 inbox:调用前 merge 那一步已经在 inbox 锁里写好了。
+# 这里再写一遍会绕过锁,把 agent 在这几毫秒里用 watch-ack.sh 删掉的项写回来
+emit_data_and_exit() {  # $1=exit_code  $2=json数组(只用来记日志)  $3=signal对象
   printf '%s\n' "$3" > "$SIGNAL"
   touch "$WAKE"
   log "exit $1, inbox $(printf '%s' "$2" | jq -c 'length') 项"
   exit "$1"
 }
 
-# 守护模式下的「叫醒」:写 inbox / signal、刷新 wake 文件,但不退出 —— 由 watch-wait.sh 去叫 agent
-emit_data_and_continue() {  # $1=json数组  $2=signal对象
-  printf '%s\n' "$1" > "$INBOX"
+# 守护模式下的「叫醒」:写 signal、刷新 wake 文件,但不退出 —— 由 watch-wait.sh 去叫 agent(inbox 已在 merge 那步写好)
+emit_data_and_continue() {  # $1=json数组(只用来记日志)  $2=signal对象
   printf '%s\n' "$2" > "$SIGNAL"
   touch "$WAKE"
   log "inbox $(printf '%s' "$1" | jq -c 'length') 项,已刷新 wake,继续轮询"
@@ -210,14 +215,15 @@ if [ "$SEED" = "1" ]; then
   latest=$(printf '%s' "$items" | jq -r 'sort_by(.at) | .[-1].at // ""')
   cursor_ids_at "$items" "$latest" > "$CURSOR_IDS"
   printf '%s' "$latest" > "$CURSOR_F"
-  printf '[]\n' > "$INBOX"
+  inbox_lock "$STATE_DIR" || { echo "拿不到 inbox 锁,seed 中止" >&2; exit 1; }
+  INBOX_LOCKED=1; inbox_write "$INBOX" '[]'; inbox_unlock "$STATE_DIR"; INBOX_LOCKED=0
   log "seeded cursor=$latest"
   echo "seeded '$NAME' cursor=$latest"
   exit 0
 fi
 
 log "循环启动 pid=$$ interval=${INTERVAL}s max_runtime=${MAX_RUNTIME}s backoff=$BACKOFF daemon=$DAEMON"
-started=$(date +%s); cur_interval=$INTERVAL; probe_fails=0; DAEMON_FAIL_ALERT=${WATCH_DAEMON_FAIL_ALERT:-3}
+started=$(date +%s); cur_interval=$INTERVAL; probe_fails=0; lock_fails=0; DAEMON_FAIL_ALERT=${WATCH_DAEMON_FAIL_ALERT:-3}
 
 while true; do
   now=$(date +%s)
@@ -259,6 +265,23 @@ while true; do
       # 跟 inbox 里没处理完的旧项合并。控制信号不该出现在 inbox 里,这里再防一手。
       # kind 用 tostring 兜一下:probe 完全可以吐一个非字符串的 kind,而 test() 遇到
       # 非字符串会直接报错 —— 那会走到下面的 bail,而不是悄悄把 inbox 清空。
+      # 读改写 inbox 全程持锁,和 watch-ack.sh 互斥
+      if ! inbox_lock "$STATE_DIR"; then
+        # 游标没推进,下一轮会把同一批项再拿到,不会丢。但一直拿不到锁就等于新项永远进不了
+        # inbox、agent 永远不会被叫醒 —— 和 probe 失败一样,连续到阈值就写 signal 叫人
+        if [ "$DAEMON" = "1" ]; then
+          lock_fails=$((lock_fails + 1))
+          log "拿不到 inbox 锁(连续第 ${lock_fails} 次),本轮跳过、下一轮重试"
+          if [ "$lock_fails" -eq "$DAEMON_FAIL_ALERT" ]; then
+            printf '%s\n' "$(jq -n --arg d "连续 $lock_fails 次拿不到 inbox 锁,看看 $STATE_DIR/inbox.lock 是不是残留" --arg n "$NAME" '{kind:"guard-error", watch:$n, detail:$d}')" > "$SIGNAL"
+            touch "$WAKE"
+          fi
+          sleep "$cur_interval"; continue
+        fi
+        bail "拿不到 inbox 锁(watch-ack.sh 卡住了?),本轮不写 inbox、游标不推进"
+      fi
+      lock_fails=0
+      INBOX_LOCKED=1
       old=$(cat "$INBOX" 2>/dev/null); [ -z "$old" ] && old='[]'
       printf '%s' "$old" | jq -e 'type == "array"' >/dev/null 2>&1 \
         || bail "inbox.json 不是合法 JSON 数组,拒绝覆盖它(里面可能还有没处理的项)"
@@ -283,7 +306,9 @@ while true; do
 
       # 先落盘 inbox,再推 cursor_ids 和游标 —— 顺序反了的话中途挂掉会永久丢事件;
       # 现在这个顺序下中途挂掉最多重复投递,由 inbox 的 unique_by 吸收
-      printf '%s\n' "$merged" > "$INBOX"
+      inbox_lock_owned "$STATE_DIR" || bail "inbox 锁在读改写途中被接管了,本轮不写 inbox、游标不推进"
+      inbox_write "$INBOX" "$merged" || bail "写 inbox 失败,游标不推进"
+      inbox_unlock "$STATE_DIR"; INBOX_LOCKED=0
       printf '%s\n' "$new_seen" > "$CURSOR_IDS"
       printf '%s' "$latest" > "$CURSOR_F"
 

@@ -12,7 +12,8 @@
 #   退出时 stdout 第一行写明是哪个 watch
 #
 # 退出码:
-#   10  inbox.json 里有待处理项(agent 处理完要把 inbox 写成 [],再重挂本脚本)
+#   10  inbox.json 里有待处理项(agent 处理完用 watch-ack.sh 删掉处理过的项,再重挂本脚本;
+#       inbox 里还剩项时,重挂会立刻再退出 10 —— 这是故意的,免得剩下的项没人看)
 #   11  循环报了 terminal(signal.json kind=terminal),收尾,不用再挂
 #   12  循环报了 probe 出错(signal.json kind=guard-error,且是本次等待期间写的)。循环还活着、会自己重试;
 #       agent 看一眼 detail,确认不是持续性故障后重挂本脚本
@@ -42,7 +43,9 @@ case "$TIMEOUT" in ''|*[!0-9]*|0) echo "--timeout 必须是正整数" >&2; exit 
 command -v jq >/dev/null 2>&1 || { echo "找不到 jq" >&2; exit 1; }
 
 
-mtime() { stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null || echo 0; }
+# GNU stat 的 -f 是「文件系统信息」,先试 GNU 写法,只取一行数字
+mtime() { local t; t=$(stat -c %Y "$1" 2>/dev/null) || t=$(stat -f %m "$1" 2>/dev/null) || t=0
+  t=$(printf '%s' "$t" | head -n1); case "$t" in ''|*[!0-9]*) t=0 ;; esac; echo "$t"; }
 started=$(date +%s)
 
 while true; do
