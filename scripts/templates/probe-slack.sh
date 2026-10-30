@@ -17,7 +17,7 @@
 #
 # 为什么要 all-threads:频道读取走的是 `slackcli conversations read <channel>`,也就是
 # conversations.history 接口,它**只返回顶层消息**,thread 里的回复不在里面(回复时勾了
-# 「同时发到频道」的 thread_broadcast 例外,但那种带 subtype,本来就被滤掉)。旧的频道模板
+# 「同时发到频道」的 thread_broadcast 例外,它两边都会出现,按 id 去重)。旧的频道模板
 # 注释写着「默认包含 thread 回复」,是错的 —— 有人回在 thread 里,watch 一直报「无变化」,
 # 前后踩过好几次,都是人来问才发现。thread 回复只能逐个 thread 用 --thread-ts 去拉。
 #
@@ -40,6 +40,7 @@
 #   THREAD_SCAN 可选  all-threads 模式扫最近多少条顶层消息找 thread,默认 30。
 #                     更早的顶层消息底下的新回复看不到 —— 这是用来控成本的上限
 #   THREAD_CACHE_DIR 可选 all-threads 模式的 thread 缓存目录,默认 ${TMPDIR:-/tmp}/incremental-watch-slack
+#   SNAPSHOT_LAG 可选 all-threads 模式的快照滞后秒数,默认 10(见下)
 #   EXCLUDE_REPLIES 可选  旧参数,=1 等于 SLACK_MODE=top-level。和 SLACK_MODE=all-threads 同时给会报错
 #   TERMINATE_RE 可选 正则;某条消息命中就报 terminal(比如 '结了|closed|done')
 #
@@ -64,19 +65,28 @@
 # 10 位整数部分),直接当游标;id 也是 ts,同一会话内唯一。所以**换模式不用重新 seed**:
 # 从 top-level 换到 all-threads 后,游标之后发在 thread 里的回复会在下一轮补上来。
 #
-# all-threads 怎么控 API 成本(稳态每轮 2 次请求 + 有新回复的 thread 各 1 次):
+# all-threads 怎么控 API 成本(稳态每轮 2 次请求;有新回复的 thread 再各拉 2 轮):
 #   1. 顶层:跟 top-level 一样,1 次 history(带 --oldest=游标)
 #   2. 找 thread:1 次 history --limit THREAD_SCAN,只挑 reply_count > 0 的
 #   3. 逐个 thread 判断要不要拉,能跳就跳:
 #      a. 父消息带 latest_reply(直接打 Slack API 时有;slackcli 0.9–0.14 的 JSON 不带)
 #         且 latest_reply <= 游标 → 跳过
-#      b. 否则看缓存:上次拉这个 thread 时 reply_count 是 n、所有回复的 ts 都 <= last。
-#         这次 reply_count 还是 n 且 last <= 游标 → 跳过
+#      b. 否则看缓存:上次拉这个 thread 时 reply_count 是 n,「会叫醒你的回复」(过滤掉自己
+#         和 bot 之后剩下的)ts 都 <= last。这次 reply_count 还是 n、last <= 游标,并且这个
+#         n 已经连续拉到过两次(stable)→ 跳过
 #      c. 剩下的才拉,带 --oldest=游标,只取游标之后的回复
-#   缓存记的是「这个 thread 在 n 条回复时,最新回复不晚于 last」,跟哪个 watch 的游标无关,
-#   所以同一频道的多个 watch 可以共用一份;循环推进游标失败时 last > 游标,下一轮照样重拉,
-#   不会漏。代价:一轮之内有人删一条又回一条、reply_count 恰好不变,这条会漏(直到下次
-#   reply_count 变化)。缓存写不了就退化成每轮拉全部有回复的 thread,结果不变,只是贵。
+#   缓存的含义跟哪个 watch 的游标无关,只跟过滤规则有关(文件名里带过滤规则的摘要),所以
+#   同一频道、同样过滤规则的多个 watch 可以共用一份。循环推进游标失败时 last > 游标,下一轮
+#   照样重拉,不会漏。最后一条回复是你自己发的时候,它被滤掉,last 停在游标上,照样能跳过。
+#   「连续两次才算 stable」是防 history 的 reply_count 已经加一、replies 接口却还没返回那条
+#   回复:第二轮会再拉一次补上。代价:一轮之内有人删一条又回一条、reply_count 恰好不变,
+#   这条会漏(直到下次 reply_count 变化)。缓存是空的那一轮(第一次跑、TMPDIR 被清)要把
+#   THREAD_SCAN 范围内有回复的 thread 都拉一遍;缓存写不了就每轮都这样,结果不变,只是贵。
+#
+# all-threads 一轮要读好几次(顶层、各个 thread),读的时刻不同,但只推进一个游标。为了不让
+# 后读到的较新回复把先读时还没出现的消息「越过去」,每轮开头取一个快照时刻
+# SNAP = 现在 - SNAPSHOT_LAG(默认 10 秒),ts 晚于 SNAP 的项这一轮先不交出去,下一轮再给。
+# 代价是新消息最多晚 SNAPSHOT_LAG 秒 + 一个轮询间隔叫醒你。
 #
 # 关于「取满一页」,两条实测结论,别混:
 #   1. 读会话历史不带 --oldest 时,截断丢的是**最旧**的消息 —— Slack 返回的是最近 N 条。
@@ -96,8 +106,8 @@
 # CLI 会把进度行("- Fetching messages...")打到 stdout,偶尔还会在 JSON **后面**追一段
 # "Update available: ..." 升级提示。json_only 只留从第一个 { 到最后一个 } 结尾的行。
 #
-# slackcli 版本:thread 模式验证过 0.7.x / 0.9.x(0.7 只有 `messages` 子命令,自动回退,
-# 但不能翻页,取满 LIMIT 就 fail closed);其它两种模式只验证过 0.9.x。其它版本 fail closed,
+# slackcli 版本:thread 模式验证过 0.7.x / 0.9.x / 0.14.x(0.7 只有 `messages` 子命令,自动回退,
+# 但不能翻页,取满 LIMIT 就 fail closed);其它两种模式验证过 0.9.x / 0.14.x,不做 0.7 回退。其它版本 fail closed,
 # 手跑确认 JSON 结构没变后用 SLACKCLI_ALLOW_UNTESTED=1 放行。
 
 set -uo pipefail
@@ -131,15 +141,15 @@ if [ "$MODE" = "thread" ]; then require_env CHANNEL THREAD_TS SELF; else require
 ver=$(slackcli --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1)
 if [ "$MODE" = "thread" ]; then
   case "$ver" in
-    0.7.*|0.7|0.9.*|0.9) : ;;
+    0.7.*|0.7|0.9.*|0.9|0.14.*|0.14) : ;;
     *) [ "${SLACKCLI_ALLOW_UNTESTED:-0}" = "1" ] \
-         || { echo "未验证的 slackcli 版本 '$ver'(已验证 0.7.x / 0.9.x)。手跑一次确认 JSON 输出结构后,用 SLACKCLI_ALLOW_UNTESTED=1 放行" >&2; exit 2; } ;;
+         || { echo "未验证的 slackcli 版本 '$ver'(已验证 0.7.x / 0.9.x / 0.14.x)。手跑一次确认 JSON 输出结构后,用 SLACKCLI_ALLOW_UNTESTED=1 放行" >&2; exit 2; } ;;
   esac
 else
   case "$ver" in
-    0.9.*|0.9) : ;;
+    0.9.*|0.9|0.14.*|0.14) : ;;
     *) [ "${SLACKCLI_ALLOW_UNTESTED:-0}" = "1" ] \
-         || { echo "未验证的 slackcli 版本 '$ver'(本模板 $MODE 模式已验证 0.9.x)。手跑一次确认 JSON 输出结构后,用 SLACKCLI_ALLOW_UNTESTED=1 放行" >&2; exit 2; } ;;
+         || { echo "未验证的 slackcli 版本 '$ver'(本模板 $MODE 模式已验证 0.9.x / 0.14.x)。手跑一次确认 JSON 输出结构后,用 SLACKCLI_ALLOW_UNTESTED=1 放行" >&2; exit 2; } ;;
   esac
 fi
 
@@ -149,6 +159,8 @@ LIMIT="${LIMIT:-100}"
 MAX_PAGES="${MAX_PAGES:-20}"
 THREAD_SCAN="${THREAD_SCAN:-30}"
 TERMINATE_RE="${TERMINATE_RE:-}"
+SNAPSHOT_LAG="${SNAPSHOT_LAG:-10}"
+case "$SNAPSHOT_LAG" in ''|*[!0-9]*) echo "SNAPSHOT_LAG 必须是非负整数,收到: '$SNAPSHOT_LAG'" >&2; exit 3 ;; esac
 
 # 数值配置必须先校验:非数字的 MAX_PAGES 会让 -gt 比较每轮报错返回假,翻页上限静默失效,
 # fail-closed 路径整个绕过;LIMIT 非数字则「取满一页」的判断同样失真。启动前挡住,exit 3
@@ -182,7 +194,8 @@ NORMALIZE_JQ='
                            or ($markre != "" and ($t | test($markre))))
                         | not)))
       | select(.bot_id == null)
-      | select((.subtype // "") == "")          # 滤掉 join/leave/pin 这类系统消息
+      # 滤掉 join/leave/pin 这类系统消息;「同时发到频道」的回复和带文件的消息是人发的,留着
+      | select((.subtype // "") as $st | $st == "" or $st == "thread_broadcast" or $st == "file_share")
       | (if $thread != "" then $thread else (.thread_ts // .ts) end) as $root
       | select(($toponly | not) or $root == .ts)
       | {id: .ts,
@@ -200,11 +213,11 @@ normalize() {  # stdin = 一页原始 JSON;$1=thread ts(可空) $2=toponly(true/
 
 # 读一个会话(thread 为空)或一条 thread,按需翻页。
 # $1=thread ts(空 = 会话历史) $2=起始 oldest(空 = 不限) $3=toponly
-# 成功:结果数组放 OUT,本次见到的所有原始消息里最大的 ts 放 RAW_MAX,return 0
+# 成功:结果数组放 OUT,return 0
 # 失败:return 3(原因已打到 stderr);thread 第一页就失败时 return 4,调用方决定要不要试旧 CLI
-OUT='[]'; RAW_MAX=""
+OUT='[]'
 read_pages() {
-  local thr="$1" oldest="$2" toponly="$3" pages=0 raw rc count more next items acc='[]' mx=""
+  local thr="$1" oldest="$2" toponly="$3" pages=0 raw rc count more next items acc='[]'
   local args
   while :; do
     pages=$((pages + 1))
@@ -227,9 +240,8 @@ read_pages() {
     more=$(printf '%s' "$raw" | jq -r '.has_more // false')
     items=$(printf '%s' "$raw" | normalize "$thr" "$toponly") \
       || { echo "slackcli 输出结构不符合预期,先手跑一次确认字段名" >&2; return 3; }
-    acc=$(jq -cn --argjson a "$acc" --argjson b "$items" '$a + $b')
+    acc=$(printf '%s\n%s' "$acc" "$items" | jq -cs 'add')   # 走 stdin,别走 argv(大 thread 会撑爆参数上限)
     next=$(printf '%s' "$raw" | jq -r '[.messages[].ts] | max // empty')
-    if [ -n "$next" ] && { [ -z "$mx" ] || [[ "$next" > "$mx" ]]; }; then mx="$next"; fi
     # 会话历史没游标时这一页就是最新一页,再往后翻只会是空 —— 直接收工
     [ -z "$thr" ] && [ -z "$oldest" ] && break
     [ "$count" -lt "$LIMIT" ] && [ "$more" != "true" ] && break     # 不满一页且没有更多 = 到底了
@@ -242,7 +254,7 @@ read_pages() {
     fi
     oldest="$next"
   done
-  OUT="$acc"; RAW_MAX="$mx"
+  OUT="$acc"
   return 0
 }
 
@@ -264,12 +276,19 @@ read_thread_legacy() {  # $1=thread ts;成功放 OUT
   fi
   OUT=$(printf '%s' "$raw" | normalize "$thr" false) \
     || { echo "slackcli 输出结构不符合预期,先手跑一次确认字段名" >&2; return 3; }
-  RAW_MAX=$(printf '%s' "$raw" | jq -r '[.messages[].ts] | max // empty')
 }
 
-read_thread() {  # $1=thread ts $2=oldest;成功放 OUT / RAW_MAX
+read_thread() {  # $1=thread ts $2=oldest;成功放 OUT
   read_pages "$1" "$2" false; local rc=$?
-  [ $rc -eq 4 ] && { read_thread_legacy "$1"; rc=$?; }
+  if [ $rc -eq 4 ]; then
+    if [ "$MODE" = "thread" ]; then   # 只有 thread 模式支持 0.7;其它模式第一页失败就是失败
+      read_thread_legacy "$1"; rc=$?
+    else
+      echo "拉 thread $1 失败 —— 拒绝返回不完整结果,游标保持不动" >&2
+      echo "手跑一次确认:slackcli conversations read $CHANNEL --thread-ts $1 --limit 5 --json" >&2
+      rc=3
+    fi
+  fi
   return $rc
 }
 
@@ -283,15 +302,22 @@ if [[ "${PROBE_CURSOR:-}" =~ ^[0-9]{10,}\.[0-9]+$ ]]; then
   CUR="$PROBE_CURSOR"
 fi
 
+# 快照时刻,只在 all-threads 用(见头注释)。必须在第一次读取之前取
+SNAP="$(( $(date +%s) - SNAPSHOT_LAG )).999999"
+
+WORK=$(mktemp -d) || exit 3
+trap 'rm -rf "$WORK"' EXIT
+add_items() { printf '%s\n' "$1" >> "$WORK/items"; }   # 每行一个数组,最后 jq -s 合并
+
 # ---------- thread 模式 ----------
 if [ "$MODE" = "thread" ]; then
   read_thread "$THREAD_TS" "$CUR" || exit 3
-  ITEMS="$OUT"
+  add_items "$OUT"
 else
   # ---------- 顶层(top-level / all-threads 共用) ----------
   toponly=false; [ "$MODE" = "top-level" ] && toponly=true
   read_pages "" "$CUR" "$toponly" || exit 3
-  ITEMS="$OUT"
+  add_items "$OUT"
 
   # ---------- all-threads:再看最近 THREAD_SCAN 条顶层消息底下的 thread ----------
   if [ "$MODE" = "all-threads" ]; then
@@ -305,43 +331,58 @@ else
         | {ts, n: .reply_count, latest: (.latest_reply // null)} ]') \
       || { echo "slackcli 输出结构不符合预期(扫 thread 列表),先手跑一次确认字段名" >&2; exit 3; }
 
-    # 缓存:{ "<父消息 ts>": {n: reply_count, last: 当时所有回复的 ts 上界} }
+    # 缓存:{ "<父消息 ts>": {n: reply_count, last: 会叫醒你的回复的 ts 上界, stable: 这个 n 是否已连续拉到两次} }
+    # 「会叫醒你」取决于过滤规则,所以文件名里带 SELF / AGENT_MARK / AGENT_MARK_RE 的摘要
     cache_dir="${THREAD_CACHE_DIR:-${TMPDIR:-/tmp}/incremental-watch-slack}"
-    cache_file="$cache_dir/threads-${CHANNEL//[^A-Za-z0-9_-]/_}.json"
-    cache=$(cat "$cache_file" 2>/dev/null)
-    printf '%s' "$cache" | jq -e 'type == "object"' >/dev/null 2>&1 || cache='{}'
+    fkey=$(printf '%s|%s|%s' "$SELF" "$MARK" "$MARKRE" | cksum | cut -d' ' -f1)
+    cache_file="$cache_dir/threads-${CHANNEL//[^A-Za-z0-9_-]/_}-$fkey.json"
+    # 坏掉的条目一律丢掉(当没缓存,多拉而已),不能让它把整个计划搞崩
+    cache=$(jq -c 'if type == "object" then with_entries(select(.value | type == "object"
+                     and (.n | type) == "number" and (.last | type) == "string" and (.stable | type) == "boolean"))
+                   else {} end' "$cache_file" 2>/dev/null)
+    [ -n "$cache" ] || cache='{}'
 
     # 每个 thread 决定拉还是跳。没有 ts 游标(seed / ISO 游标)时一律拉
     plan=$(jq -cn --argjson p "$parents" --argjson c "$cache" --arg cur "$CUR" '
       [ $p[] | . as $x | ($c[$x.ts] // null) as $e
-        | if $cur == "" then $x + {fetch: true}
-          elif $x.latest != null and $x.latest <= $cur then $x + {fetch: false, keep: {n: $x.n, last: $x.latest}}
-          elif $e != null and $e.n == $x.n and ($e.last // "") <= $cur then $x + {fetch: false, keep: $e}
-          else $x + {fetch: true} end ]')
+        | if $cur == "" then $x + {fetch: true, prev: $e}
+          elif $x.latest != null and $x.latest <= $cur then $x + {fetch: false, keep: {n: $x.n, last: $x.latest, stable: true}}
+          elif $e != null and $e.n == $x.n and $e.stable and $e.last <= $cur then $x + {fetch: false, keep: $e}
+          else $x + {fetch: true, prev: $e} end ]') \
+      || { echo "排 thread 拉取计划失败 —— 拒绝返回不完整结果" >&2; exit 3; }
 
-    new_cache='{}'
-    while IFS=$'\t' read -r pts pn fetch keep; do
+    : > "$WORK/cache"
+    while IFS=$'\t' read -r pts pn fetch keep prev_n; do
       [ -n "$pts" ] || continue
       if [ "$fetch" = "true" ]; then
         read_thread "$pts" "$CUR" || exit 3
-        ITEMS=$(jq -cn --argjson a "$ITEMS" --argjson b "$OUT" '$a + $b')
-        # 拉到底了:此刻所有回复的 ts 都 <= max(本次见到的最大 ts, oldest)
-        last="$RAW_MAX"
+        add_items "$OUT"
+        # 拉到底了:会叫醒你的回复,ts 都 <= max(本次拿到的最大 ts, oldest)
+        last=$(printf '%s' "$OUT" | jq -r 'map(.at) | max // ""')
         if [ -n "$CUR" ] && { [ -z "$last" ] || [[ "$CUR" > "$last" ]]; }; then last="$CUR"; fi
-        keep=$(jq -cn --argjson n "$pn" --arg last "$last" '{n: $n, last: $last}')
+        stable=false; [ "$prev_n" = "$pn" ] && stable=true
+        keep=$(jq -cn --argjson n "$pn" --arg last "$last" --argjson st "$stable" '{n: $n, last: $last, stable: $st}')
       fi
-      new_cache=$(jq -cn --argjson a "$new_cache" --arg k "$pts" --argjson v "$keep" '$a + {($k): $v}')
-    done < <(printf '%s' "$plan" | jq -r '.[] | [.ts, (.n|tostring), (.fetch|tostring), ((.keep // {})|tojson)] | @tsv')
+      printf '%s\t%s\n' "$pts" "$keep" >> "$WORK/cache"
+    done < <(printf '%s' "$plan" | jq -r '.[] | [.ts, (.n|tostring), (.fetch|tostring), ((.keep // {})|tojson), ((.prev.n // "")|tostring)] | @tsv')
 
     # 只留这次扫到的 thread,文件大小有上界。写不了就算了,下一轮多拉几次而已
     if mkdir -p "$cache_dir" 2>/dev/null; then
       tmp="$cache_file.$$"
-      printf '%s\n' "$new_cache" > "$tmp" 2>/dev/null && mv -f "$tmp" "$cache_file" 2>/dev/null || rm -f "$tmp" 2>/dev/null
+      jq -Rn '[inputs | split("\t") | {key: .[0], value: (.[1] | fromjson)}] | from_entries' "$WORK/cache" > "$tmp" 2>/dev/null \
+        && mv -f "$tmp" "$cache_file" 2>/dev/null || rm -f "$tmp" 2>/dev/null
     fi
   fi
 fi
 
-ITEMS=$(printf '%s' "$ITEMS" | jq -c 'unique_by(.id) | sort_by(.at)')
+ITEMS=$(jq -cs 'add // [] | unique_by(.id) | sort_by(.at)' "$WORK/items") \
+  || { echo "合并结果失败" >&2; exit 3; }
+
+# all-threads:晚于快照的这一轮先不交(见头注释),下一轮再给
+if [ "$MODE" = "all-threads" ]; then
+  ITEMS=$(printf '%s' "$ITEMS" | jq -c --argjson snap "$SNAP" 'map(select((.at | tonumber) <= $snap))')
+fi
+
 
 if [ -n "$TERMINATE_RE" ]; then
   ITEMS=$(printf '%s' "$ITEMS" | jq -c --arg re "$TERMINATE_RE" '

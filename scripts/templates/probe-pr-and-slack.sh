@@ -9,7 +9,7 @@
 #
 # 配置(环境变量):PR 侧和 Slack 侧的都要给
 #   REPO, PR, GITHUB_SELF             见 probe-github-pr.sh
-#   CHANNEL, THREAD_TS, SLACK_SELF    见 probe-slack-thread.sh
+#   CHANNEL, THREAD_TS, SLACK_SELF    见 probe-slack.sh(thread 模式)
 #
 # 这里必须用 GITHUB_SELF / SLACK_SELF 两个名字。两个模板单独用时都认 SELF,合在一起时
 # 后设的那个会盖掉前一个 —— 被盖掉的那一侧就不再过滤自己,于是你自己的回复把自己叫醒,

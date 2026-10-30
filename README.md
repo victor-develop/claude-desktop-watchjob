@@ -85,15 +85,17 @@ scripts/watch-loop.sh --name pr-123 --probe scripts/templates/probe-github-pr.sh
 |---|---|---|---|
 | `thread` | replies in the one thread at `THREAD_TS` | 1 | a discussion you started |
 | `top-level` | top-level messages of a channel or DM, no threads | 1 | busy public channels |
-| `all-threads` | top-level messages plus new replies in every thread under the last `THREAD_SCAN` (default 30) top-level messages | 2 + one per thread with new replies | DMs, and anywhere a missed reply is costly |
+| `all-threads` | top-level messages plus new replies in every thread under the last `THREAD_SCAN` (default 30) top-level messages | 2 in steady state; a thread with new replies costs one extra request on each of the next two polls | DMs, and anywhere a missed reply is costly |
 
 Without `SLACK_MODE` it picks `thread` when `THREAD_TS` is set and `all-threads` otherwise. Use
 `all-threads` for DMs: people sometimes answer inline and sometimes in a thread, and both have been
 missed in practice. Slack's history endpoint never returns thread replies, so `all-threads` fetches
 threads one by one — but only those that may have something new: it compares the parent's
 `latest_reply` with the cursor when the CLI provides it, and otherwise keeps a small cache of each
-thread's `reply_count` and newest reply `ts`, skipping threads whose count hasn't changed and whose
-replies are all at or before the cursor. All three modes use the Slack `ts` as the cursor and emit
+thread's `reply_count` and newest reply `ts`, skipping threads whose count hasn't changed (confirmed on two polls) and whose
+wake-worthy replies are all at or before the cursor. Because one poll reads several places at
+different moments, items newer than `SNAPSHOT_LAG` seconds (default 10) are held back to the next
+poll, so a reply fetched late can't push the cursor past a message that wasn't visible yet. All three modes use the Slack `ts` as the cursor and emit
 the same item shape (`kind` is `slack-message` for top-level and `slack-reply` for replies;
 `thread_ts` names the thread, `null` at top level), so you can switch modes without re-seeding.
 
@@ -102,8 +104,8 @@ with `EXCLUDE_REPLIES=1`) are kept as thin wrappers so existing watches keep wor
 
 In `thread` mode the Slack template supports both slackcli command shapes, trying them in order and only
 falling back if the first fails: `slackcli conversations read <channel> --thread-ts <ts>`
-(0.7+) and `slackcli messages --channel <channel> --thread <ts>` (older builds). It also
-normalises their differing output — 0.7+ puts users in a top-level `users[]` and messages
+(0.9+) and `slackcli messages --channel <channel> --thread <ts>` (0.7 and older). It also
+normalises their differing output — 0.9+ puts users in a top-level `users[]` and messages
 carry only `.user`, so the template joins on id to recover display names, and it skips the
 progress lines that build prints to stdout before the JSON. If neither shape works it exits 3
 carrying both attempts' stderr, rather than degrading into "no new messages" — the failure
@@ -172,7 +174,7 @@ judgment call.
 ./tests/test-parallel.sh 5      #  8 assertions: N loops stay isolated
 ./tests/test-templates.sh       # 68 assertions: template filtering, pagination, failure propagation
 ./tests/test-ack.sh             # 21 assertions: watch-ack contract, lock takeover, no lost items when racing the loop
-./tests/test-slack-modes.sh     # 43 assertions: the three Slack modes, thread-reply pickup, cursor, skipped unchanged threads
+./tests/test-slack-modes.sh     # 51 assertions: the three Slack modes, thread-reply pickup, cursor, skipped unchanged threads
 ```
 
 None of them touch the network — `gh` and `slackcli` are replaced by stubs on `PATH`, and the

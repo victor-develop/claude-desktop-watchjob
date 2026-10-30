@@ -68,8 +68,9 @@ probe 是一个可执行脚本,唯一职责:**把当前状态压成一个 JSON �
   用 thread 模式盯自己那条消息,对方直接在 DM 里回就永远收不到(2026-09-22);用只看顶层的读法,
   对方回在 thread 里也永远收不到(2026-10-28、10-30 各一次,都是人来问才发现)
 - 会话历史接口(`conversations.history`)**本来就不返回 thread 回复**,所以 `top-level` 真的只有顶层;
-  `all-threads` 是逐个 thread 去拉的。它的成本:稳态每轮 2 次请求,外加「有新回复的 thread」各 1 次 ——
-  没有新回复的 thread 靠 reply_count 缓存跳过,不会每轮全拉一遍
+  `all-threads` 是逐个 thread 去拉的。它的成本:稳态每轮 2 次请求;某个 thread 有了新回复,
+  接下来两轮各多拉它 1 次。没有新回复的 thread 靠 reply_count 缓存跳过,不会每轮全拉一遍(缓存是空的
+  那一轮除外)。为了一轮里先后读几处不互相越过,新消息会晚 `SNAPSHOT_LAG`(默认 10 秒)再交
 - 三种模式的游标都是 Slack ts,inbox 项形状一样(顶层 `kind=slack-message`、回复 `kind=slack-reply`,
   `thread_ts` 告诉你回在哪个 thread 里,顶层为 null),**换模式不用重新 seed**
 - 旧入口 `probe-slack-thread.sh`(= `thread`)和 `probe-slack-channel.sh`(= `all-threads`,

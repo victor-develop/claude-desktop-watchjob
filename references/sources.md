@@ -19,7 +19,7 @@ Slack 只有一个入口 `probe-slack.sh`,用 `SLACK_MODE` 选模式:
 |---|---|---|---|
 | `thread` | `THREAD_TS` 那一条 thread 的回复 | 1 | 盯自己发起的那条讨论 |
 | `top-level` | 频道 / DM 的顶层消息,不看 thread | 1 | 量大的公共频道 |
-| `all-threads` | 顶层 + 最近 `THREAD_SCAN`(默认 30)条顶层消息底下所有 thread 的新回复 | 2 + 有新回复的 thread 数 | DM,以及「回在哪儿都得看到」的兜底场景 |
+| `all-threads` | 顶层 + 最近 `THREAD_SCAN`(默认 30)条顶层消息底下所有 thread 的新回复 | 稳态 2;有新回复的 thread 接下来两轮各多 1 次 | DM,以及「回在哪儿都得看到」的兜底场景 |
 
 不给 `SLACK_MODE` 时:给了 `THREAD_TS` 就是 `thread`,否则是 `all-threads`。三种模式的游标都是
 Slack ts,inbox 项形状一样(`{id, who, at, kind, thread_ts, body}`,顶层 `kind=slack-message`、
@@ -29,7 +29,9 @@ Slack ts,inbox 项形状一样(`{id, who, at, kind, thread_ts, body}`,顶层 `ki
 `conversations.history`,只返回顶层消息。想看 thread 回复只能逐个 thread 用 `--thread-ts` 去拉 ——
 `all-threads` 就是这么做的,并且尽量少拉:父消息带 `latest_reply` 时(直接打 Slack API 才有,
 slackcli 的 JSON 不带)用它和游标比;否则在 `THREAD_CACHE_DIR` 记一份「上次拉时 reply_count 是 n、
-所有回复都不晚于 last」,这次 reply_count 没变且 last 不晚于游标就跳过。细节在模板头注释。
+会叫醒你的回复都不晚于 last」,这次 reply_count 没变(且已连续确认过两次)、last 不晚于游标就跳过。
+一轮里要读好几次,为了不让后读到的新回复把先读时还没出现的消息越过去,晚于「现在 - `SNAPSHOT_LAG`
+(默认 10 秒)」的项留到下一轮再交。细节在模板头注释。
 
 旧的 `probe-slack-thread.sh`(= `thread` 模式)和 `probe-slack-channel.sh`(= `all-threads`,
 `EXCLUDE_REPLIES=1` 时 = `top-level`)还在,是转给 `probe-slack.sh` 的兼容入口,已经在跑的
@@ -44,8 +46,8 @@ watch 不用改。
 
 另外两种模式只验证过 0.9.x,不做 0.7 回退。
 
-输出结构也一并归一:0.7+ 把用户信息平铺在顶层 `users[]`、消息里只有 `.user`,模板按 id
-关联出姓名;老版本消息自带 `.user_name` 就直接用。0.7+ 还会先往 stdout 打进度行
+输出结构也一并归一:0.9+ 把用户信息平铺在顶层 `users[]`、消息里只有 `.user`,模板按 id
+关联出姓名;老版本消息自带 `.user_name` 就直接用。0.9+ 还会先往 stdout 打进度行
 (`- Fetching messages...`),模板从第一个 `{` 开始截。两种形状都不认时报 exit 3,并把两次
 尝试的 stderr 一起带出来 —— 不让它退化成「没有新消息」,那种失败最难发现。
 

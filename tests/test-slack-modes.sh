@@ -42,6 +42,13 @@ while [ \$# -gt 0 ]; do
   esac
 done
 [ -n "\$thr" ] && [ "\$thr" = "\${STUB_FAIL_THREAD:-}" ] && { echo "thread fetch boom" >&2; exit 1; }
+# STUB_RACE_FLAG 指向不存在的文件时:第一次拉 thread 之前,模拟「顶层读完之后」有人先发了一条
+# 顶层消息、紧接着在 thread 里回了一条(两条 ts 都是现在)
+if [ -n "\$thr" ] && [ -n "\${STUB_RACE_FLAG:-}" ] && [ ! -f "\$STUB_RACE_FLAG" ]; then
+  : > "\$STUB_RACE_FLAG"; now=\$(date +%s)
+  jq --arg ts "\$((now - 1)).000100" '. + [{ts:\$ts, user:"U_ALICE", text:"读完顶层之后才发的顶层"}]' "$D/history.json" > "$D/h.tmp" && mv "$D/h.tmp" "$D/history.json"
+  jq --arg ts "\$now.000200" --arg p "\$thr" '. + [{ts:\$ts, thread_ts:\$p, user:"U_ALICE", text:"紧接着回在 thread 里"}]' "$D/thread-\$thr.json" > "$D/t.tmp" && mv "$D/t.tmp" "$D/thread-\$thr.json"
+fi
 echo "- Fetching messages..."
 if [ -n "\$thr" ]; then
   jq -c --arg o "\$oldest" --argjson l "\$limit" '
@@ -163,7 +170,10 @@ eq "seed" "$(run --seed)" "0"
 eq "seed 后游标 = 所有可见消息里最新的(含 thread 回复)" "$(cat "$ST/cursor")" "1000000350.000100"
 : > "$CALLS"
 eq "没新消息 → 跑满 13" "$(run --interval 1 --max-runtime 3)" "13"
-eq "稳态没有 thread 被重拉" "$(thread_calls)" "0"
+: > "$CALLS"
+OUT=$(SELF_KEEP_HUMAN=1 PROBE_CURSOR=$(cat "$ST/cursor") "$T_DIR/probe-slack-channel.sh")
+eq "缓存热了之后:没有新东西" "$OUT" "[]"
+eq "稳态没有 thread 被重拉,每轮只有 2 次请求" "$(thread_calls) $(wc -l < "$CALLS" | tr -d ' ')" "0 2"
 
 add_reply $P1 1000000400.000100 U_ALICE "R6 新回复,回在旧 thread 里"
 : > "$CALLS"
@@ -172,8 +182,18 @@ eq "inbox 拿到这条回复" "$(jq -c '[.[] | [(.id|.[7:10]), .kind, .thread_ts
 eq "游标推进到这条回复" "$(cat "$ST/cursor")" "1000000400.000100"
 eq "只拉了有变化的那条 thread" "$(grep -- '--thread-ts' "$CALLS" | grep -c -- "$P3")" "0"
 : > "$CALLS"
-eq "再跑一轮 → 13" "$(run --interval 1 --max-runtime 3)" "13"
-eq "处理过的 thread 不再重拉" "$(thread_calls)" "0"
+: > "$CALLS"; SELF_KEEP_HUMAN=1 PROBE_CURSOR=$(cat "$ST/cursor") "$T_DIR/probe-slack-channel.sh" >/dev/null
+eq "回复数刚变的 thread 下一轮再确认一次" "$(grep -- '--thread-ts' "$CALLS" | grep -c -- "$P1")" "1"
+: > "$CALLS"; SELF_KEEP_HUMAN=1 PROBE_CURSOR=$(cat "$ST/cursor") "$T_DIR/probe-slack-channel.sh" >/dev/null
+eq "确认过之后不再重拉" "$(thread_calls)" "0"
+
+echo "== 最后一条回复是自己发的:照样能跳过,不会每轮重拉 =="
+add_reply $P1 1000000410.000100 U_ME "[ 🐶 Claude:] agent 回了一句"
+for i in 1 2; do SELF_KEEP_HUMAN=1 PROBE_CURSOR=$(cat "$ST/cursor") "$T_DIR/probe-slack-channel.sh" >/dev/null; done
+: > "$CALLS"
+OUT=$(SELF_KEEP_HUMAN=1 PROBE_CURSOR=$(cat "$ST/cursor") "$T_DIR/probe-slack-channel.sh")
+eq "自己的回复不叫醒" "$OUT" "[]"
+eq "第三轮起不再拉这个 thread" "$(thread_calls)" "0"
 
 echo "== 循环没推进游标时,缓存不会吞掉回复 =="
 add_reply $P3 1000000450.000100 U_ALICE "R7"
@@ -199,6 +219,22 @@ rm -rf "$T/cache"; : > "$CALLS"
 OUT=$(STUB_LATEST=1 PROBE_CURSOR=1000000420.000100 SLACK_MODE=all-threads "$PROBE")
 eq "只有 P3 的 latest_reply 晚于游标" "$(echo "$OUT" | ids)" '["450"]'
 eq "只拉了 P3" "$(grep -- '--thread-ts' "$CALLS" | sed 's/.*--thread-ts \([^ ]*\).*/\1/' | sort -u | tr '\n' ' ')" "$P3 "
+
+echo "== 一轮里先后读多个源:后读到的新回复不会把先读时还没出现的顶层消息越过去 =="
+rm -rf "$T/cache"; ST3="$T/st3"
+run3() { SLACK_MODE=all-threads SELF_KEEP_HUMAN=1 "$LOOP" --name m3 --probe "$PROBE" --state-dir "$ST3" "$@" >/dev/null 2>&1; echo $?; }
+eq "seed" "$(run3 --seed)" "0"
+rm -rf "$T/cache"   # 让下一轮一定去拉 thread,竞态才会出现
+OUT=$(STUB_RACE_FLAG="$T/race" SLACK_MODE=all-threads SELF_KEEP_HUMAN=1 PROBE_CURSOR=$(cat "$ST3/cursor") "$PROBE")
+eq "竞态这一轮:晚于快照的都先不交" "$OUT" "[]"
+OUT=$(SLACK_MODE=all-threads SELF_KEEP_HUMAN=1 SNAPSHOT_LAG=0 PROBE_CURSOR=$(cat "$ST3/cursor") "$PROBE")
+eq "过了快照之后:顶层和 thread 回复都拿到" "$(echo "$OUT" | jq -c '[.[].body]')" '["读完顶层之后才发的顶层","紧接着回在 thread 里"]'
+SNAPSHOT_LAG=x "$PROBE" >/dev/null 2>&1; eq "SNAPSHOT_LAG 非数字 → exit 3" "$?" "3"
+
+echo "== 缓存文件坏了不会把 thread 全跳过 =="
+for f in "$T/cache"/*.json; do printf '{"%s":"x","%s":{"n":"bad"}}' "$P1" "$P3" > "$f"; done
+OUT=$(SLACK_MODE=all-threads SELF_KEEP_HUMAN=1 PROBE_CURSOR=1000000440.000100 "$PROBE"); rc=$?
+eq "照样拉 thread,拿到 R7" "$rc $(echo "$OUT" | jq -c '[.[].id | .[7:10]] | map(select(. == "450"))')" '0 ["450"]'
 
 echo "== 出错 fail closed =="
 rm -rf "$T/cache"
