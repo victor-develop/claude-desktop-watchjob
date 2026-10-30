@@ -50,21 +50,33 @@ probe 是一个可执行脚本,唯一职责:**把当前状态压成一个 JSON �
 |---|---|---|
 | `probe-github-pr.sh` | PR 评论 + inline review + review 状态;merge/close 收尾 | `REPO` `PR` `SELF` |
 | `probe-github-checks.sh` | CI 跑完(绿了红了都叫,中间态不叫) | `REPO` `PR` |
-| `probe-slack-thread.sh` | 一条 thread 的回复 | `CHANNEL` `THREAD_TS` `SELF` |
-| `probe-slack-channel.sh` | 一个频道 / DM 里的新消息(不限 thread) | `CHANNEL` `SELF` |
-| `probe-pr-and-slack.sh` | 上面两个合成**一个** watch | `REPO` `PR` `GITHUB_SELF` `CHANNEL` `THREAD_TS` `SLACK_SELF` |
+| `probe-slack.sh` | Slack,`SLACK_MODE` 选三种模式之一(见下) | `CHANNEL` `SELF`(thread 模式另要 `THREAD_TS`) |
+| `probe-pr-and-slack.sh` | PR + 一条 Slack thread 合成**一个** watch | `REPO` `PR` `GITHUB_SELF` `CHANNEL` `THREAD_TS` `SLACK_SELF` |
 | `probe-http-json.sh` | 任意返回 JSON 列表的接口 | `URL` `MAP` |
 
-**两个 Slack 模板怎么选:**
+**Slack 选哪种模式(`SLACK_MODE`):**
 
-- 盯一条 PR 讨论 / 一条已经开起来的 thread → `probe-slack-thread.sh`
-- 盯一个频道,或者盯 DM → `probe-slack-channel.sh`
-- **DM 一律用 channel 版。** 私聊里大家习惯直接回,不开 thread;用 thread 版盯自己那条
-  消息的 `thread_ts`,对方在 DM 里直接回你就永远收不到,watch 一路报「无变化」
-  (2026-09-22 真踩过一次,最后是人来提醒才发现)
-- channel 版默认**也包含** thread 里的回复,所以「对方开不开 thread」这个不确定性它都
-  兜住了;只要顶层消息就 `EXCLUDE_REPLIES=1`
-- 两个模板的游标都是 Slack ts、inbox 项形状也一样,换模板不用重新 seed
+| 模式 | 看什么 | 什么时候用 |
+|---|---|---|
+| `thread` | 一条 thread(`THREAD_TS`)的回复 | 盯**自己发起**的那条讨论 —— 你在 thread 里抛了问题,等人回 |
+| `top-level` | 频道 / DM 的顶层消息,不看 thread | **量大的公共频道**:每轮只打 1 次接口,thread 里的闲聊不叫醒你 |
+| `all-threads` | 顶层 + 最近 `THREAD_SCAN`(默认 30)条顶层消息底下所有 thread 的新回复 | **DM**,以及对方回在哪儿你都得看到的**兜底**场景 |
+
+- 不给 `SLACK_MODE`:有 `THREAD_TS` 就是 `thread`,否则 `all-threads`。拿不准就用 `all-threads` ——
+  漏一条回复(人来问「你怎么没看到」)比每轮多打几次接口贵得多
+- **DM 一律 `all-threads`。** 私聊里有人直接回、有人回在 thread 里,两种都真踩过:
+  用 thread 模式盯自己那条消息,对方直接在 DM 里回就永远收不到(2026-09-22);用只看顶层的读法,
+  对方回在 thread 里也永远收不到(2026-10-28、10-30 各一次,都是人来问才发现)
+- 会话历史接口(`conversations.history`)**本来就不返回 thread 回复**,所以 `top-level` 真的只有顶层;
+  `all-threads` 是逐个 thread 去拉的。它的成本:稳态每轮 2 次请求;某个 thread 有了新回复,
+  接下来两轮各多拉它 1 次。没有新回复的 thread 靠 reply_count 缓存跳过,不会每轮全拉一遍(缓存是空的
+  那一轮除外)。为了一轮里先后读几处不互相越过,新消息会晚 `SNAPSHOT_LAG`(默认 10 秒)再交
+- 三种模式的游标都是 Slack ts,inbox 项形状一样(顶层 `kind=slack-message`、回复 `kind=slack-reply`,
+  `thread_ts` 告诉你回在哪个 thread 里,顶层为 null),**换模式不用重新 seed**
+- 旧入口 `probe-slack-thread.sh`(= `thread`)和 `probe-slack-channel.sh`(= `all-threads`,
+  `EXCLUDE_REPLIES=1` 时 = `top-level`)还能用,已经在跑的 watch 不用改
+- agent 用你本人账号发言时,配 `AGENT_MARK` / `AGENT_MARK_RE`(或 `SELF_KEEP_HUMAN=1`,等于按
+  `[ 🐶 Claude:]` 前缀),只滤带前缀的自己,你本人手打的照样叫醒 agent。三种模式同一套规则
 
 配置全走环境变量,直接把模板当 `--probe` 用,不用改文件。变量从启动 `watch-loop.sh` 的
 shell 继承,所以要在同一条命令里 export。每个模板顶部注释是完整用法。
@@ -208,7 +220,7 @@ harness 的通知里带退出码。状态目录 `~/.claude/watch/<name>/` 里有
 - `scripts/watch-loop.sh` —— 通用循环。游标、inbox 合并去重、锁、退出码、活动窗口、守护模式都在里面
 - `scripts/watch-wait.sh` —— 守护模式的叫醒器:只读本地文件,有事就退出叫醒 agent,一个可以等多个循环
 - `scripts/watch-ack.sh` —— 处理完后按 id 从 inbox 删项,和循环共用 inbox 锁;`scripts/inbox-lock.sh` 是两边共用的锁和原子写
-- `scripts/templates/` —— 现成 probe(GitHub PR / CI checks / Slack thread / Slack 频道·DM /
+- `scripts/templates/` —— 现成 probe(GitHub PR / CI checks / Slack 三种模式 /
   PR+Slack 合并 / HTTP JSON),配置走环境变量,直接可用。`_lib.sh` 里有 `require_env` 和 `run_with_timeout`
 - `references/sources.md` —— 怎么挑模板、怎么自己写一个
 - `references/mechanics.md` —— 这个形状是怎么试出来的:实测过的平台行为、以及 cron 和
