@@ -9,22 +9,40 @@ probe 的唯一职责:**把当前状态压成一个 JSON 数组**,每项带一�
 |---|---|---|
 | `probe-github-pr.sh` | PR 的评论 + inline review + review 状态;merge/close 时收尾 | `REPO` `PR` `SELF` |
 | `probe-github-checks.sh` | CI 跑完没,绿了红了都叫你;中间态不叫 | `REPO` `PR` |
-| `probe-slack-thread.sh` | 一条 thread 的回复 | `CHANNEL` `THREAD_TS` `SELF` |
-| `probe-slack-channel.sh` | 一个频道 / DM 里的新消息(不限 thread) | `CHANNEL` `SELF` |
-| `probe-pr-and-slack.sh` | 上面两个合成一个 watch(见下) | `REPO` `PR` `GITHUB_SELF` `CHANNEL` `THREAD_TS` `SLACK_SELF` |
+| `probe-slack.sh` | Slack,三种模式:一条 thread / 频道·DM 顶层 / 顶层 + 所有 thread 的新回复(见下) | `CHANNEL` `SELF`(thread 模式另要 `THREAD_TS`) |
+| `probe-pr-and-slack.sh` | PR + 一条 Slack thread 合成一个 watch(见下) | `REPO` `PR` `GITHUB_SELF` `CHANNEL` `THREAD_TS` `SLACK_SELF` |
 | `probe-http-json.sh` | 任意返回 JSON 列表的接口 | `URL` `MAP` |
 
-两个 Slack 模板的分工:thread 版只看 `THREAD_TS` 底下的回复,channel 版看整个会话
-(顶层消息 + thread 回复,`EXCLUDE_REPLIES=1` 可以只要顶层)。**盯 DM 用 channel 版** ——
-私聊里对方通常直接回、不开 thread,thread 版会一路报「无变化」。两者游标同为 Slack ts、
-inbox 项形状一致,可以互换。channel 版只验证过 slackcli 0.9.x,不做 0.7 回退。
+Slack 只有一个入口 `probe-slack.sh`,用 `SLACK_MODE` 选模式:
 
-`probe-slack-thread.sh` 兼容两种 slackcli 命令形状,按顺序尝试、只有第一种失败才试第二种:
+| `SLACK_MODE` | 看什么 | 每轮请求数 | 什么时候用 |
+|---|---|---|---|
+| `thread` | `THREAD_TS` 那一条 thread 的回复 | 1 | 盯自己发起的那条讨论 |
+| `top-level` | 频道 / DM 的顶层消息,不看 thread | 1 | 量大的公共频道 |
+| `all-threads` | 顶层 + 最近 `THREAD_SCAN`(默认 30)条顶层消息底下所有 thread 的新回复 | 2 + 有新回复的 thread 数 | DM,以及「回在哪儿都得看到」的兜底场景 |
+
+不给 `SLACK_MODE` 时:给了 `THREAD_TS` 就是 `thread`,否则是 `all-threads`。三种模式的游标都是
+Slack ts,inbox 项形状一样(`{id, who, at, kind, thread_ts, body}`,顶层 `kind=slack-message`、
+回复 `kind=slack-reply`),所以换模式不用重新 seed。
+
+**会话历史接口拿不到 thread 回复。** `slackcli conversations read <channel>` 走的是
+`conversations.history`,只返回顶层消息。想看 thread 回复只能逐个 thread 用 `--thread-ts` 去拉 ——
+`all-threads` 就是这么做的,并且尽量少拉:父消息带 `latest_reply` 时(直接打 Slack API 才有,
+slackcli 的 JSON 不带)用它和游标比;否则在 `THREAD_CACHE_DIR` 记一份「上次拉时 reply_count 是 n、
+所有回复都不晚于 last」,这次 reply_count 没变且 last 不晚于游标就跳过。细节在模板头注释。
+
+旧的 `probe-slack-thread.sh`(= `thread` 模式)和 `probe-slack-channel.sh`(= `all-threads`,
+`EXCLUDE_REPLIES=1` 时 = `top-level`)还在,是转给 `probe-slack.sh` 的兼容入口,已经在跑的
+watch 不用改。
+
+`thread` 模式兼容两种 slackcli 命令形状,按顺序尝试、只有第一种失败才试第二种:
 
 ```text
-1. slackcli conversations read <channel> --thread-ts <ts> --limit N --json   (0.7+)
-2. slackcli messages --channel <channel> --thread <ts> --json               (更早的版本)
+1. slackcli conversations read <channel> --thread-ts <ts> --limit N --json   (0.9)
+2. slackcli messages --channel <channel> --thread <ts> --json               (0.7 及更早)
 ```
+
+另外两种模式只验证过 0.9.x,不做 0.7 回退。
 
 输出结构也一并归一:0.7+ 把用户信息平铺在顶层 `users[]`、消息里只有 `.user`,模板按 id
 关联出姓名;老版本消息自带 `.user_name` 就直接用。0.7+ 还会先往 stdout 打进度行
@@ -98,4 +116,5 @@ PROBE_CURSOR="<上面输出里最大的 at>" ./probe.sh | jq 'length'  # 应该�
 第二条是关键。给了最新游标还返回非空,说明游标字段选错了,循环会无限叫醒你。
 
 模板本身有测试兜底:`tests/test-templates.sh` 用 stub 的 `gh` / `slackcli` 和 `file://`
-验过滤、排序、terminal 判定和合并逻辑,不碰网络。
+验过滤、排序、terminal 判定和合并逻辑;`tests/test-slack-modes.sh` 验 Slack 三种模式(thread 回复
+抓得到、带前缀的自己被滤、游标推进、没变化的 thread 不重拉)。都不碰网络。

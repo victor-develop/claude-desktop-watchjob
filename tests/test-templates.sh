@@ -151,8 +151,8 @@ eq "$n_all 个模板语法通过" "$n_ok" "$n_all"
 
 # ---------- 2. 必填校验 ----------
 echo "== 缺参数要清晰报错（退出 2），而不是吐半个数组 =="
-for f in probe-github-pr.sh probe-slack-thread.sh probe-github-checks.sh probe-http-json.sh probe-pr-and-slack.sh; do
-  out=$(env -u REPO -u PR -u SELF -u GITHUB_SELF -u CHANNEL -u THREAD_TS -u SLACK_SELF -u URL -u MAP \
+for f in probe-github-pr.sh probe-slack-thread.sh probe-slack-channel.sh probe-slack.sh probe-github-checks.sh probe-http-json.sh probe-pr-and-slack.sh; do
+  out=$(env -u REPO -u PR -u SELF -u GITHUB_SELF -u CHANNEL -u THREAD_TS -u SLACK_SELF -u URL -u MAP -u SLACK_MODE \
         "$T_DIR/$f" 2>&1 >/dev/null); rc=$?
   if [ "$rc" = "2" ] && echo "$out" | grep -q "缺少必需的环境变量"; then ok "$f 缺参数 → exit 2"
   else bad "$f 缺参数 → rc=$rc out=$out"; fi
@@ -307,11 +307,15 @@ out=$(bash -c '. "$1/_lib.sh"; require_bin gh jq' _ "$T_DIR" 2>&1); rc=$?
 eq "require_bin 命令都在 → 通过" "$rc" "0"
 
 for pair in "probe-github-pr.sh:gh jq" "probe-github-checks.sh:gh jq" \
-            "probe-slack-thread.sh:slackcli jq" "probe-http-json.sh:curl jq" \
+            "probe-slack.sh:slackcli jq" "probe-http-json.sh:curl jq" \
             "probe-pr-and-slack.sh:gh slackcli jq"; do
   f="${pair%%:*}"; want="${pair##*:}"
   got=$(grep -m1 '^require_bin ' "$T_DIR/$f" | sed 's/^require_bin //')
   eq "$f 声明依赖" "$got" "$want"
+done
+# 两个旧 Slack 模板是 probe-slack.sh 的兼容入口,依赖由它声明
+for f in probe-slack-thread.sh probe-slack-channel.sh; do
+  grep -q '^exec "$(dirname "$0")/probe-slack.sh"' "$T_DIR/$f" && ok "$f 转给 probe-slack.sh" || bad "$f 没转给 probe-slack.sh"
 done
 grep -q "^command -v jq" "$LOOP" && ok "watch-loop.sh 自己也检查 jq" || bad "watch-loop.sh 没检查 jq"
 
