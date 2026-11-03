@@ -4,15 +4,20 @@ A watch loop for Claude Desktop that **costs zero tokens while nothing is happen
 the agent only when a cursor diff says something actually changed.
 
 ```
-a background shell loop            ← sleeping is free
+a detached shell loop                     ← sleeping is free
   ├─ run a probe, diff against a cursor   ← all judgment happens in shell
   ├─ nothing new  → sleep, keep going
-  └─ something new → write inbox.json → exit   ← exiting IS the wake-up
+  └─ something new → write inbox.json → message the session directly   ← delivery IS the wake-up
 ```
 
-Launch it with the Bash tool's `run_in_background: true`. The script survives across turns, and
-when it exits the harness wakes the agent and hands it the exit code. So the decision *"is this
-worth interrupting the model for?"* runs in shell, for free.
+Recommended: start the loop with `--relay` under `nohup`. When something changes it delivers a
+short notice straight into a named Claude Desktop session through `claude -p` with only the
+`SendMessage` tool enabled, then keeps polling. No helper has to sit in the session's background
+tasks, so there is no 2-hour re-arm and no exit-code bookkeeping. The decision *"is this worth
+interrupting the model for?"* still runs in shell, for free.
+
+The original exit-code mode is still there: launch the loop (or `watch-wait.sh`) with the Bash
+tool's `run_in_background: true`, and the harness wakes the agent when it exits.
 
 Works for anything you can diff with a cursor: PR comments and reviews, CI status, Slack thread
 replies, HTTP JSON endpoints, directory changes.
@@ -50,6 +55,47 @@ cp -r claude-desktop-watchjob ~/.claude/skills/incremental-watch
 
 `SKILL.md` carries the agent-facing instructions. Requires `bash`, `jq`, and whatever CLI your
 probe uses.
+
+## Direct delivery (`--relay`)
+
+```bash
+export REPO=owner/repo PR=123 SELF=your-github-login
+export WATCH_TARGET_SESSION="PR 123 watch"   # the session title in the Desktop sidebar
+export WATCH_TARGET_SESSION_LINK="claude://claude.ai/epitaxy/local_<id>"   # optional, used to wake it
+
+scripts/watch-loop.sh --name pr-123 --probe scripts/templates/probe-github-pr.sh --seed
+nohup scripts/watch-loop.sh --name pr-123 --probe scripts/templates/probe-github-pr.sh \
+  --interval 120 --relay >/dev/null 2>&1 & disown
+```
+
+How a delivery works (`scripts/watch-relay.sh`):
+
+- The notice is built from a fixed template: watch name, event kind, inbox item count, file paths
+  and the `watch-ack.sh` command. No inbox item content goes into it, so instructions planted in
+  a PR comment or Slack message never reach the target session through this channel.
+- A short `claude -p --tools SendMessage --permission-mode auto` process sends it by session name;
+  success means the model answered `DELIVERED`.
+- Claude Desktop stops idle session processes (idle timeout, memory pressure), and a stopped
+  session cannot be found by name. With `WATCH_TARGET_SESSION_LINK` set, a failed delivery opens
+  that link to bring the session back, waits `WATCH_WAKE_WAIT` seconds (default 10) and tries once more.
+- Still failing, the notice goes to `<state>/relay-pending.json` and is retried on later polls,
+  at most every `WATCH_RELAY_RETRY` seconds (default 60). Notices that pile up are merged into one
+  delivery. The inbox is the durable queue, so a late notice loses nothing.
+- Before the loop exits (terminal, max-runtime, fatal error) it keeps retrying until the notice is
+  delivered. Killed with TERM/INT/HUP, it makes one best-effort `loop-exit` delivery.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `WATCH_TARGET_SESSION` | required | target session title. Brackets and `@` (half or full width) make `SendMessage` fail to resolve it, so the loop refuses them at startup |
+| `WATCH_TARGET_SESSION_LINK` | empty | `claude://claude.ai/epitaxy/local_<id>`, opened to wake a stopped session |
+| `WATCH_WAKE_WAIT` | `10` | seconds to wait after opening the link |
+| `WATCH_RELAY_RETRY` | `60` | minimum seconds between retries of a queued notice |
+| `WATCH_RELAY_MODEL` | `haiku` | model for the delivery process |
+| `WATCH_RELAY_TIMEOUT` | `120` | timeout of one `claude -p` call |
+
+Pick a target session title that is unique: if another session has the same title, the notice
+may land there. You can test a target by hand with
+`scripts/watch-relay.sh --name <watch> --signals '[{"kind":"new-items"}]'`.
 
 ## Usage
 
@@ -175,15 +221,18 @@ judgment call.
 ./tests/test-templates.sh       # 68 assertions: template filtering, pagination, failure propagation
 ./tests/test-ack.sh             # 21 assertions: watch-ack contract, lock takeover, no lost items when racing the loop
 ./tests/test-slack-modes.sh     # 51 assertions: the three Slack modes, thread-reply pickup, cursor, skipped unchanged threads
+./tests/test-relay.sh           # 27 assertions: --relay delivery, queue and retry, delivery before exit, wake via link
 ```
 
-None of them touch the network — `gh` and `slackcli` are replaced by stubs on `PATH`, and the
+None of them touch the network — `gh`, `slackcli` and `claude` are replaced by stubs, and the
 HTTP template is exercised over `file://`. All of them finish in seconds.
 
 ## Limitations
 
-- Quitting the app takes the loop with it — it's a child of the claude process. Nothing restarts
-  it automatically.
+- Quitting the app takes a `run_in_background` loop with it, since it's a child of the claude
+  process. A `nohup` loop (`--daemon` or `--relay`) survives. Nothing restarts either automatically.
+- `--relay` needs the `claude` CLI logged in on the same machine, and each delivery is one short
+  model call. A loop killed with SIGKILL sends nothing.
 - One loop per `--name` (directory lock): starting a second one exits 1 while the first is alive,
   and takes over the lock if the previous holder died. Different names run fully independently;
   5 in parallel is verified, higher counts are untested.

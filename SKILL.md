@@ -8,14 +8,16 @@ description: 盯住一个会增量更新的外部源,睡在后台不烧 token,�
 盯一个外部源,直到出现值得你介入的变化。核心形状:
 
 ```
-一个后台 shell 循环          ← 睡着的时候 0 token
+一个 nohup 起的 shell 循环   ← 睡着的时候 0 token
   ├─ 跑 probe,跟游标比对    ← 判断全在 shell,不进你的上下文
   ├─ 没新东西 → sleep,继续
-  └─ 有新东西 → 写 inbox → exit ← 退出就是唤醒你
+  └─ 有新东西 → 写 inbox → 直接投递一条通知进你的会话 ← 投递就是唤醒你
 ```
 
-用 Bash 工具的 `run_in_background: true` 启动。后台脚本跨轮次存活,退出时 harness 会自动
-唤醒你,并告诉你退出码。所以「什么时候该叫醒 agent」这个判断被搬到了 shell 里,免费执行。
+默认用 `--relay`:循环有事时起一个只开放 SendMessage 的 `claude -p` 短进程,按会话名把通知
+投递进你所在的 Desktop 会话,然后接着轮询。所以「什么时候该叫醒 agent」这个判断在 shell 里
+免费执行,也不用在 harness 里挂一个叫醒器、每 2 小时重挂一次。老办法(`run_in_background`
+加退出码)还在,见第 3 步末尾。
 
 ## 为什么是这个形状
 
@@ -94,7 +96,37 @@ scripts/watch-loop.sh --name <名字> --probe <probe路径> --seed
 
 不 seed 的话首轮会把全部历史当成新增,白叫醒你一次。
 
-### 3. 启动循环(默认:守护模式,跑 3 天)
+### 3. 启动循环(默认:直接投递模式,跑 3 天)
+
+```bash
+REPO=owner/repo PR=1234 SELF=your-login \
+WATCH_TARGET_SESSION="<你当前会话的标题>" \
+WATCH_TARGET_SESSION_LINK="claude://claude.ai/epitaxy/local_<会话 id>" \
+  nohup ~/.claude/skills/incremental-watch/scripts/watch-loop.sh \
+    --name pr-1234 \
+    --probe ~/.claude/skills/incremental-watch/scripts/templates/probe-github-pr.sh \
+    --interval 120 --relay >/dev/null 2>&1 & disown
+```
+
+- `WATCH_TARGET_SESSION` 填你当前会话在侧边栏里的标题,要唯一,否则可能投进同名的别的会话。
+  **标题里不能有括号和 @**(半角全角都算),SendMessage 解析不了,循环启动时直接拒绝。
+  标题不合适就先改名
+- `WATCH_TARGET_SESSION_LINK` 强烈建议配:Desktop 会因空闲超时或内存压力停掉会话进程,进程
+  不在时按名字投递会失败。配了链接,失败后会先 `open` 链接把会话拉起来再投一次
+- 还是投不出去(会话改名、归档,或 Desktop 没开),通知进 `relay-pending.json`,之后每轮轮询
+  时重投(间隔不短于 `WATCH_RELAY_RETRY`,默认 60 秒),攒下的多条合并成一次投递。inbox
+  本身不丢,晚投只是晚,不漏项
+- 循环要退出前(terminal、跑满 max-runtime、致命错误)会一直重投到成功才退出;被 TERM/INT/HUP
+  杀掉时尽力补投一条 loop-exit。SIGKILL 什么都发不出去
+- 想先确认投得到:`scripts/watch-relay.sh --name <名字> --signals '[{"kind":"new-items"}]'`,
+  你会收到一条通知
+
+收到的通知只有 watch 名、事件种类、inbox 项数和文件路径,不含任何一项的内容,外部源里夹带的
+指令不会经这条路进到你的会话。
+
+#### 不能用直接投递时:守护循环加叫醒器
+
+没有 Desktop 会话可投(比如纯 CLI),就用下面这套退出码的办法。
 
 Claude Code 的后台 Bash 最多活 **2 小时**(`timeout` 上限 7200000ms),到点被 harness 直接杀掉
 (状态是 killed,不是 exit 13,锁也不释放)。要盯几天的东西,循环就不能挂在 harness 下面。
@@ -130,7 +162,12 @@ REPO=owner/repo PR=1234 SELF=your-login \
 
 ### 4. 被唤醒后
 
-harness 的通知里带退出码。状态目录 `~/.claude/watch/<name>/` 里有两个文件,分工是硬的:
+`--relay` 模式下唤醒你的是一条投递进来的消息,开头是 `【incremental-watch】watch <名字> 有动静`,
+写着事件种类(新增项 / terminal / probe 出错 / 跑满 / 循环意外退出)。新增项照下面 10 的处理走,
+**不用重挂任何东西**,循环一直在跑;terminal 时循环已经自己退出,收尾即可;跑满或意外退出时
+按原命令重新 nohup 拉起。
+
+退出码模式下,harness 的通知里带退出码。状态目录 `~/.claude/watch/<name>/` 里有两个文件,分工是硬的:
 
 - **`inbox.json`** —— 真实数据项,累积去重。循环只做 merge 追加,不会丢弃未处理项;
   删项是你的事,而且**只用 `watch-ack.sh` 删你处理过的那几项**(见下)。唯一的例外是 `--seed`,
@@ -218,6 +255,7 @@ harness 的通知里带退出码。状态目录 `~/.claude/watch/<name>/` 里有
 ## 文件
 
 - `scripts/watch-loop.sh` —— 通用循环。游标、inbox 合并去重、锁、退出码、活动窗口、守护模式都在里面
+- `scripts/watch-relay.sh` —— 直接投递:把通知投递进 `WATCH_TARGET_SESSION`,失败时 open 会话链接唤醒再投。`--relay` 模式的循环调用它,也可以手动跑一次试投
 - `scripts/watch-wait.sh` —— 守护模式的叫醒器:只读本地文件,有事就退出叫醒 agent,一个可以等多个循环
 - `scripts/watch-ack.sh` —— 处理完后按 id 从 inbox 删项,和循环共用 inbox 锁;`scripts/inbox-lock.sh` 是两边共用的锁和原子写
 - `scripts/templates/` —— 现成 probe(GitHub PR / CI checks / Slack 三种模式 /
@@ -236,4 +274,5 @@ harness 的通知里带退出码。状态目录 `~/.claude/watch/<name>/` 里有
 | `log` | 循环追加 | 每轮一行。probe 的 stderr 也在这 |
 | `meta.json` | 循环 | 启动参数和 pid |
 | `lock/` | 循环 | 目录锁,同名只允许一个循环 |
+| `relay-pending.json` | 循环(`--relay`) | 没投递出去的通知和下次重投时间,投递成功后删掉 |
 | `inbox.lock/` | 循环 / `watch-ack.sh` | 读改写 inbox 时的短锁,只持有一瞬间;超过 30 秒视为残留自动接管 |
