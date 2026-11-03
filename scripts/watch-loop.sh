@@ -16,7 +16,7 @@
 #                       probe 出错只记 log、下一轮重试,连续失败 3 次(WATCH_DAEMON_FAIL_ALERT)才写 signal + 刷新 wake。用 nohup 脱离 harness 启动,
 #                       再用 watch-wait.sh(run_in_background)等 wake 叫醒 agent
 #   --relay             直接投递模式(隐含 --daemon):有事时用 watch-relay.sh 把通知直接投递进
-#                       WATCH_TARGET_SESSION 指定的 Desktop 会话,不需要 watch-wait.sh。投递失败的通知
+#                       WATCH_TARGET_SESSION_LINK 指定的 Desktop 会话,不需要 watch-wait.sh。投递失败的通知
 #                       落 <state>/relay-pending.json,每轮轮询时重投(间隔不短于 WATCH_RELAY_RETRY 秒,默认 60)。
 #                       terminal、max-runtime、致命错误这类退出前的通知会一直重投到成功才退出。
 #                       目标会话、唤醒链接等配置见 watch-relay.sh 顶部注释

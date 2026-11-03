@@ -60,8 +60,7 @@ probe uses.
 
 ```bash
 export REPO=owner/repo PR=123 SELF=your-github-login
-export WATCH_TARGET_SESSION="PR 123 watch"   # the session title in the Desktop sidebar
-export WATCH_TARGET_SESSION_LINK="claude://claude.ai/epitaxy/local_<id>"   # optional, used to wake it
+export WATCH_TARGET_SESSION_LINK="claude://claude.ai/epitaxy/local_<id>"   # the target session's link
 
 scripts/watch-loop.sh --name pr-123 --probe scripts/templates/probe-github-pr.sh --seed
 nohup scripts/watch-loop.sh --name pr-123 --probe scripts/templates/probe-github-pr.sh \
@@ -73,11 +72,16 @@ How a delivery works (`scripts/watch-relay.sh`):
 - The notice is built from a fixed template: watch name, event kind, inbox item count, file paths
   and the `watch-ack.sh` command. No inbox item content goes into it, so instructions planted in
   a PR comment or Slack message never reach the target session through this channel.
-- A short `claude -p --tools SendMessage --permission-mode auto` process sends it by session name;
-  success means the model answered `DELIVERED`.
+- The recipient is resolved from the session id (the `local_<id>` at the end of the link) right
+  before each delivery: `~/.claude/sessions/*.json` lists running Claude Code processes, and the
+  one whose `hostSessionId` matches and whose pid is alive gives a `messagingSocketPath`. The
+  notice goes to `uds:<that path>`. `SendMessage` inside `claude -p` accepts a session title or a
+  `uds:` address, not the `local_` id itself, hence the lookup. Renaming the session changes nothing.
+- A short `claude -p --tools SendMessage --permission-mode auto` process sends it; success means
+  the model answered `DELIVERED`.
 - Claude Desktop stops idle session processes (idle timeout, memory pressure), and a stopped
-  session cannot be found by name. With `WATCH_TARGET_SESSION_LINK` set, a failed delivery opens
-  that link to bring the session back, waits `WATCH_WAKE_WAIT` seconds (default 10) and tries once more.
+  session has no live entry. Then the link is opened to bring the session back, and after
+  `WATCH_WAKE_WAIT` seconds (default 10) the id is resolved and delivery tried once more.
 - Still failing, the notice goes to `<state>/relay-pending.json` and is retried on later polls,
   at most every `WATCH_RELAY_RETRY` seconds (default 60). Notices that pile up are merged into one
   delivery. The inbox is the durable queue, so a late notice loses nothing.
@@ -86,15 +90,17 @@ How a delivery works (`scripts/watch-relay.sh`):
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `WATCH_TARGET_SESSION` | required | target session title. Brackets and `@` (half or full width) make `SendMessage` fail to resolve it, so the loop refuses them at startup |
-| `WATCH_TARGET_SESSION_LINK` | empty | `claude://claude.ai/epitaxy/local_<id>`, opened to wake a stopped session |
+| `WATCH_TARGET_SESSION_LINK` | empty | `claude://claude.ai/epitaxy/local_<id>`. Recommended: the id is taken from it for delivery, and it is opened to wake a stopped session |
+| `WATCH_TARGET_SESSION_ID` | empty | `local_<id>`, instead of the link; the wake link is built from it |
+| `WATCH_TARGET_SESSION` | empty | session title, used when no id is set or no live process matches the id. Must be unique; brackets and `@` (half or full width) make `SendMessage` fail to resolve it, so the loop refuses them at startup. Desktop may retitle a session, which breaks title delivery |
 | `WATCH_WAKE_WAIT` | `10` | seconds to wait after opening the link |
 | `WATCH_RELAY_RETRY` | `60` | minimum seconds between retries of a queued notice |
 | `WATCH_RELAY_MODEL` | `haiku` | model for the delivery process |
 | `WATCH_RELAY_TIMEOUT` | `120` | timeout of one `claude -p` call |
 
-Pick a target session title that is unique: if another session has the same title, the notice
-may land there. You can test a target by hand with
+At least one of link, id or title is required. `~/.claude/sessions/*.json` is Claude Code's own
+bookkeeping, not a documented interface; if a future version changes it, the id lookup finds
+nothing and delivery falls back to the title when one is set. You can test a target by hand with
 `scripts/watch-relay.sh --name <watch> --signals '[{"kind":"new-items"}]'`.
 
 ## Usage
@@ -221,7 +227,8 @@ judgment call.
 ./tests/test-templates.sh       # 68 assertions: template filtering, pagination, failure propagation
 ./tests/test-ack.sh             # 21 assertions: watch-ack contract, lock takeover, no lost items when racing the loop
 ./tests/test-slack-modes.sh     # 51 assertions: the three Slack modes, thread-reply pickup, cursor, skipped unchanged threads
-./tests/test-relay.sh           # 27 assertions: --relay delivery, queue and retry, delivery before exit, wake via link
+./tests/test-relay.sh           # 33 assertions: --relay delivery, queue and retry, delivery before exit, id lookup, wake via link
+./tests/test-timeout.sh         #  6 assertions: run_with_timeout without timeout(1) kills the whole process group
 ```
 
 None of them touch the network — `gh`, `slackcli` and `claude` are replaced by stubs, and the

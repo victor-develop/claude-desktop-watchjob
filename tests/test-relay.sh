@@ -78,7 +78,9 @@ reset; mode empty; "$LOOP" --name t --probe "$T/probe.sh" --state-dir "$T/st" --
 fails 2; mode one; start --interval 1
 wait_for '[ -f "$T/st/relay-pending.json" ]' 20
 check "第一次失败后进了队列" '[ "$(jq -r ".signals[0].kind" "$T/st/relay-pending.json")" = "new-items" ]'
-check "队列记了下次重投时间" '[ "$(jq -r ".next_at" "$T/st/relay-pending.json")" -gt "$(date +%s)" ]'
+# 入队时 next_at 先清零、投递失败后才写入重投时间,等它写好再看
+wait_for '[ "$(jq -r ".next_at // 0" "$T/st/relay-pending.json" 2>/dev/null || echo 0)" -gt 0 ]' 20
+check "队列记了下次重投时间" '[ "$(jq -r ".next_at" "$T/st/relay-pending.json")" -gt 0 ]'
 wait_for '[ "$(calls OK)" -ge 1 ]' 30
 check "失败 2 次后重投成功" '[ "$(calls FAIL)" = 2 ] && [ "$(calls OK)" = 1 ]'
 check "成功后队列清空" '[ ! -f "$T/st/relay-pending.json" ]'
@@ -133,11 +135,39 @@ printf 'FAILED 找不到会话\n' > "$ANSWERS"
 "$RELAY" --name t --state-dir "$T/rs" --signals "$SIG" >/dev/null 2>&1; rc=$?
 check "FAILED 且没配链接 → exit 2" '[ "$rc" = 2 ]'
 
-printf 'FAILED 找不到会话\nDELIVERED\n' > "$ANSWERS"; : > "$T/opened"
-PATH="$T/bin:$PATH" WATCH_TARGET_SESSION_LINK="claude://claude.ai/epitaxy/local_test" \
+echo "== watch-relay.sh 按会话 id 投递 =="
+SID=local_0123abcd-0000-4000-8000-000000000001
+LNK="claude://claude.ai/epitaxy/$SID"
+mkdir -p "$T/sessions"; export WATCH_SESSIONS_DIR="$T/sessions"
+SOCK="$T/s.sock"
+python3 -c 'import socket,sys; socket.socket(socket.AF_UNIX).bind(sys.argv[1])' "$SOCK"
+register() { jq -cn --argjson p "$1" --arg s "$SID" --arg k "$SOCK" '{pid:$p, hostSessionId:$s, messagingSocketPath:$k, name:"随便改过的标题(带括号)"}' > "$T/sessions/$1.json"; }
+
+check "--check:只配链接即可" 'WATCH_TARGET_SESSION="" WATCH_TARGET_SESSION_LINK="$LNK" "$RELAY" --check 2>/dev/null'
+check "--check:id 格式不对被拒" '! WATCH_TARGET_SESSION="" WATCH_TARGET_SESSION_ID="local_x;rm" "$RELAY" --check 2>/dev/null'
+check "--check:什么都没配被拒" '! WATCH_TARGET_SESSION="" "$RELAY" --check 2>/dev/null'
+
+register $$; echo DELIVERED > "$ANSWERS"
+WATCH_TARGET_SESSION="" WATCH_TARGET_SESSION_LINK="$LNK" "$RELAY" --name t --state-dir "$T/rs" --signals "$SIG" >/dev/null 2>&1; rc=$?
+check "按 id 找到活着的会话 → exit 0" '[ "$rc" = 0 ]'
+check "收件地址是它的 uds socket" 'grep -q "to 填 \"uds:$SOCK\"" "$T/prompt"'
+
+rm -f "$T/sessions"/*.json; true & dead=$!; wait $dead; register $dead
+echo DELIVERED > "$ANSWERS"
+WATCH_TARGET_SESSION_LINK="$LNK" "$RELAY" --name t --state-dir "$T/rs" --signals "$SIG" >/dev/null 2>&1; rc=$?
+check "登记的进程已死、配了标题 → 按标题投" '[ "$rc" = 0 ] && grep -q "to 填 \"watch 测试会话\"" "$T/prompt"'
+
+# open 桩顺带把会话登记回来,模拟 Desktop 被链接唤醒
+rm -f "$T/sessions"/*.json; : > "$T/opened"; echo DELIVERED > "$ANSWERS"
+cat > "$T/bin/open" <<EOF
+#!/bin/bash
+echo "\$1" >> "\$OPENED"
+jq -cn --argjson p $$ --arg s "$SID" --arg k "$SOCK" '{pid:\$p, hostSessionId:\$s, messagingSocketPath:\$k}' > "$T/sessions/$$.json"
+EOF
+PATH="$T/bin:$PATH" WATCH_TARGET_SESSION="" WATCH_TARGET_SESSION_ID="$SID" \
   "$RELAY" --name t --state-dir "$T/rs" --signals "$SIG" >/dev/null 2>&1; rc=$?
-check "失败后 open 链接再投成功 → exit 0" '[ "$rc" = 0 ]'
-check "open 的是会话链接" '[ "$(cat "$T/opened")" = "claude://claude.ai/epitaxy/local_test" ]'
+check "会话进程不在:open 唤醒后按 id 投成功" '[ "$rc" = 0 ] && grep -q "to 填 \"uds:$SOCK\"" "$T/prompt"'
+check "只配 id 时唤醒链接按 id 拼出来" '[ "$(cat "$T/opened")" = "$LNK" ]'
 
 echo
 echo "  通过 $PASS  失败 $FAIL"

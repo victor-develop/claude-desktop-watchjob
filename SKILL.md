@@ -100,7 +100,6 @@ scripts/watch-loop.sh --name <名字> --probe <probe路径> --seed
 
 ```bash
 REPO=owner/repo PR=1234 SELF=your-login \
-WATCH_TARGET_SESSION="<你当前会话的标题>" \
 WATCH_TARGET_SESSION_LINK="claude://claude.ai/epitaxy/local_<会话 id>" \
   nohup ~/.claude/skills/incremental-watch/scripts/watch-loop.sh \
     --name pr-1234 \
@@ -108,12 +107,15 @@ WATCH_TARGET_SESSION_LINK="claude://claude.ai/epitaxy/local_<会话 id>" \
     --interval 120 --relay >/dev/null 2>&1 & disown
 ```
 
-- `WATCH_TARGET_SESSION` 填你当前会话在侧边栏里的标题,要唯一,否则可能投进同名的别的会话。
-  **标题里不能有括号和 @**(半角全角都算),SendMessage 解析不了,循环启动时直接拒绝。
-  标题不合适就先改名
-- `WATCH_TARGET_SESSION_LINK` 强烈建议配:Desktop 会因空闲超时或内存压力停掉会话进程,进程
-  不在时按名字投递会失败。配了链接,失败后会先 `open` 链接把会话拉起来再投一次
-- 还是投不出去(会话改名、归档,或 Desktop 没开),通知进 `relay-pending.json`,之后每轮轮询
+- `WATCH_TARGET_SESSION_LINK` 填你当前会话的链接(会话元数据里的 `link`)。每次投递前按链接末尾的
+  `local_<id>` 在 `~/.claude/sessions/*.json` 里找到这个会话活着的进程,投到它的 `uds:` socket 地址,
+  所以会话改标题不影响投递。也可以只配 `WATCH_TARGET_SESSION_ID=local_<id>`
+- Desktop 会因空闲超时或内存压力停掉会话进程,这时按 id 找不到活进程,脚本先 `open` 链接把会话
+  拉起来,等 `WATCH_WAKE_WAIT` 秒再找、再投一次
+- `WATCH_TARGET_SESSION`(会话标题)是备选:没配 id,或按 id 找不到活进程时才用。标题要唯一,
+  **不能有括号和 @**(半角全角都算),SendMessage 解析不了,循环启动时直接拒绝;Desktop 会自己
+  改标题,一改就投不到
+- 还是投不出去(会话归档,或 Desktop 没开),通知进 `relay-pending.json`,之后每轮轮询
   时重投(间隔不短于 `WATCH_RELAY_RETRY`,默认 60 秒),攒下的多条合并成一次投递。inbox
   本身不丢,晚投只是晚,不漏项
 - 循环要退出前(terminal、跑满 max-runtime、致命错误)会一直重投到成功才退出;被 TERM/INT/HUP
@@ -255,7 +257,7 @@ REPO=owner/repo PR=1234 SELF=your-login \
 ## 文件
 
 - `scripts/watch-loop.sh` —— 通用循环。游标、inbox 合并去重、锁、退出码、活动窗口、守护模式都在里面
-- `scripts/watch-relay.sh` —— 直接投递:把通知投递进 `WATCH_TARGET_SESSION`,失败时 open 会话链接唤醒再投。`--relay` 模式的循环调用它,也可以手动跑一次试投
+- `scripts/watch-relay.sh` —— 直接投递:按会话 id 解析出 socket 地址投递(标题作备选),找不到时 open 会话链接唤醒再投。`--relay` 模式的循环调用它,也可以手动跑一次试投
 - `scripts/watch-wait.sh` —— 守护模式的叫醒器:只读本地文件,有事就退出叫醒 agent,一个可以等多个循环
 - `scripts/watch-ack.sh` —— 处理完后按 id 从 inbox 删项,和循环共用 inbox 锁;`scripts/inbox-lock.sh` 是两边共用的锁和原子写
 - `scripts/templates/` —— 现成 probe(GitHub PR / CI checks / Slack 三种模式 /

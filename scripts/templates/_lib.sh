@@ -50,12 +50,17 @@ run_with_timeout() {
   local secs="$1"; shift
   if command -v timeout >/dev/null 2>&1;  then timeout  "$secs" "$@"; return $?; fi
   if command -v gtimeout >/dev/null 2>&1; then gtimeout "$secs" "$@"; return $?; fi
-  local tmp rc pid wd
+  local tmp rc pid wd had_m=0
   tmp=$(mktemp)
+  # 只 kill 外层子 shell 的话,命令自己起的子进程(比如 claude -p)会留下来继续挂着。
+  # 打开 job control 后每个后台任务自成一个进程组,超时时按组杀,连带杀掉它的全部子孙
+  case $- in *m*) had_m=1 ;; esac
+  set -m
   ( "$@" >"$tmp" 2>/dev/null ) & pid=$!
-  ( sleep "$secs"; kill -9 "$pid" 2>/dev/null ) >/dev/null 2>&1 & wd=$!
+  ( sleep "$secs"; kill -9 -- "-$pid" 2>/dev/null ) >/dev/null 2>&1 & wd=$!
+  [ "$had_m" = "1" ] || set +m
   wait "$pid" 2>/dev/null; rc=$?
-  kill "$wd" 2>/dev/null
+  kill -- "-$wd" 2>/dev/null; wait "$wd" 2>/dev/null
   cat "$tmp"; rm -f "$tmp"
   return $rc
 }
