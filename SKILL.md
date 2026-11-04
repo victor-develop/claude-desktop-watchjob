@@ -131,13 +131,15 @@ REPO=owner/repo PR=1234 SELF=your-login \
 #### 可选:直接投递(`--relay`,默认不用)
 
 **已知限制:权限模式不一致时通知会卡住,而且循环不知道。** 投递方是一个
-`claude -p --permission-mode auto` 进程。目标会话的权限模式跟它不一样(比如会话开着 bypass)时,
+`claude -p --permission-mode <模式>` 进程(默认 auto)。目标会话的权限模式跟它不一样(比如会话开着 bypass)时,
 Desktop 不把消息交给会话,而是挂在会话里等人点批准(提示 `held — waiting for approval`,
 `the sender's permission mode differs`)。这时 SendMessage 对发送方照样返回成功,循环记一条
 「已投递」,不会再重投,人不在电脑前时这条通知就一直卡着。2026-11-04 实测:会话是 bypass 时
 auto 发送方的通知全部卡住;把发送方换成 bypass 后,会话空闲时也能在约 10 秒内被叫醒。
-会话登记文件里没有权限模式字段,脚本没法自动对齐;投递用的模式目前写死在 `watch-relay.sh` 里。
-所以只在能确定目标会话权限模式就是 auto、而且不会中途切换时才用 `--relay`,其余情况用上面的叫醒器。
+会话登记文件里没有权限模式字段,脚本没法自动对齐,要用 `--relay-permission-mode <模式>`(或环境变量
+`WATCH_RELAY_PERMISSION_MODE`)手动设成和目标会话一样:`acceptEdits` `auto` `bypassPermissions`
+`manual` `dontAsk` `plan` 之一。所以只在确定目标会话的权限模式、而且不会中途切换时才用 `--relay`,
+其余情况用上面的叫醒器。
 
 ```bash
 REPO=owner/repo PR=1234 SELF=your-login \
@@ -269,6 +271,9 @@ WATCH_TARGET_SESSION_LINK="claude://claude.ai/epitaxy/local_<会话 id>" \
 - `scripts/watch-ack.sh` —— 处理完后按 id 从 inbox 删项,和循环共用 inbox 锁;`scripts/inbox-lock.sh` 是两边共用的锁和原子写
 - `scripts/templates/` —— 现成 probe(GitHub PR / CI checks / Slack 三种模式 /
   PR+Slack 合并 / HTTP JSON),配置走环境变量,直接可用。`_lib.sh` 里有 `require_env` 和 `run_with_timeout`
+- `scripts/slack-live/` —— Slack 实时监听模板:WebSocket 收消息、本地过滤(私聊 / @我 / @我所在的组 / 投递过的
+  thread 后续)、haiku 初判、经 `watch-relay.sh --note-file` 投递进一个会话。用户要「Slack 上找我的消息都实时
+  转给某个会话」时用它,而不是给每个频道开一个 watch。配置和前置依赖见 `references/slack-live.md`
 - `references/sources.md` —— 怎么挑模板、怎么自己写一个
 - `references/mechanics.md` —— 这个形状是怎么试出来的:实测过的平台行为、以及 cron 和
   scheduled-task 两条路为什么走不通。改动 `watch-loop.sh` 之前先读这个,免得重踩

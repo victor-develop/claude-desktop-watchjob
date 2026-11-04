@@ -1,0 +1,9 @@
+{
+  "name": "slack-live",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "slkcli": "0.2.0",
+    "ws": "8.22.1"
+  }
+}

@@ -58,7 +58,7 @@ probe uses.
 ## Direct delivery (`--relay`)
 
 Optional, not the default. **Known limitation: a notice is silently held when permission modes
-differ.** The delivery runs as `claude -p --permission-mode auto`. If the target session runs in a
+differ.** The delivery runs as `claude -p --permission-mode <mode>` (`auto` unless you set it). If the target session runs in a
 different permission mode (for example bypass), Claude Desktop does not hand the message to the
 session; it holds it in the session waiting for someone to approve it ("held — waiting for
 approval", "the sender's permission mode differs"). `SendMessage` still reports success to the
@@ -66,8 +66,9 @@ sender, so the loop logs the notice as delivered and never retries it. With nobo
 the notice just sits there. Tested 2026-11-04: with the session in bypass, every notice from an
 `auto` sender was held; with the sender switched to bypass, an idle session was woken in about 10
 seconds. The session registry has no permission-mode field, so the script cannot match it
-automatically, and the mode is currently fixed in `watch-relay.sh`. Use `--relay` only when you
-know the target session runs in `auto` and will stay there; otherwise use the waiter.
+automatically: set it yourself with `--relay-permission-mode <mode>` (or `WATCH_RELAY_PERMISSION_MODE`),
+one of `acceptEdits` `auto` `bypassPermissions` `manual` `dontAsk` `plan`, to the target session's
+mode. Use `--relay` only when you know that mode and it will not change; otherwise use the waiter.
 
 ```bash
 export REPO=owner/repo PR=123 SELF=your-github-login
@@ -88,7 +89,7 @@ How a delivery works (`scripts/watch-relay.sh`):
   one whose `hostSessionId` matches and whose pid is alive gives a `messagingSocketPath`. The
   notice goes to `uds:<that path>`. `SendMessage` inside `claude -p` accepts a session title or a
   `uds:` address, not the `local_` id itself, hence the lookup. Renaming the session changes nothing.
-- A short `claude -p --tools SendMessage --permission-mode auto` process sends it; success means
+- A short `claude -p --tools SendMessage --permission-mode <mode>` process sends it; success means
   the model answered `DELIVERED`.
 - Claude Desktop stops idle session processes (idle timeout, memory pressure), and a stopped
   session has no live entry. Then the link is opened to bring the session back, and after
@@ -113,6 +114,23 @@ At least one of link, id or title is required. `~/.claude/sessions/*.json` is Cl
 bookkeeping, not a documented interface; if a future version changes it, the id lookup finds
 nothing and delivery falls back to the title when one is set. You can test a target by hand with
 `scripts/watch-relay.sh --name <watch> --signals '[{"kind":"new-items"}]'`.
+
+## Slack live listener (`scripts/slack-live/`)
+
+A separate template for "everything addressed to me on Slack", as opposed to `probe-slack.sh`, which
+polls one channel or thread for one task. It receives messages over Slack's RTM WebSocket (pushed,
+a second or two after they are sent), backfills with `search.messages` after reconnects, and filters
+locally: DMs, messages that mention you, mentions of a user group you belong to, and follow-ups in
+threads it already delivered. Bots on a skip list, your own messages and its own auto-replies are
+dropped. What survives goes to a resident `claude -p` (haiku, no tools) for triage, and anything
+worth handling is delivered into a Claude Desktop session through `watch-relay.sh --note-file`.
+The notice carries sender, channel, timestamp, link and the triage reason, never the message text.
+
+All personal settings are environment variables (target session, permission mode, skip lists,
+auto-reply channels and byline, state directory). Slack access goes through
+[slkcli](https://github.com/therohitdas/slkcli), which reads the Slack desktop app's session on
+macOS; tokens stay inside it. Setup, configuration and limits are in
+[`references/slack-live.md`](references/slack-live.md).
 
 ## Usage
 
@@ -238,11 +256,12 @@ judgment call.
 ./tests/test-templates.sh       # 68 assertions: template filtering, pagination, failure propagation
 ./tests/test-ack.sh             # 21 assertions: watch-ack contract, lock takeover, no lost items when racing the loop
 ./tests/test-slack-modes.sh     # 51 assertions: the three Slack modes, thread-reply pickup, cursor, skipped unchanged threads
-./tests/test-relay.sh           # 33 assertions: --relay delivery, queue and retry, delivery before exit, id lookup, wake via link
+./tests/test-relay.sh           # 38 assertions: --relay delivery, queue and retry, delivery before exit, id lookup, wake via link, permission mode, --note-file
+./tests/test-slack-live.sh      # 28 assertions: slack-live filtering, triage skip rules, backfill dedup, auto-reply note, retry after restart
 ./tests/test-timeout.sh         #  6 assertions: run_with_timeout without timeout(1) kills the whole process group
 ```
 
-None of them touch the network — `gh`, `slackcli` and `claude` are replaced by stubs, and the
+None of them touch the network — `gh`, `slackcli`, the Slack WebSocket and `claude` are replaced by stubs, and the
 HTTP template is exercised over `file://`. All of them finish in seconds.
 
 ## Limitations
