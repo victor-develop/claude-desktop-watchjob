@@ -11,13 +11,13 @@ description: 盯住一个会增量更新的外部源,睡在后台不烧 token,�
 一个 nohup 起的 shell 循环   ← 睡着的时候 0 token
   ├─ 跑 probe,跟游标比对    ← 判断全在 shell,不进你的上下文
   ├─ 没新东西 → sleep,继续
-  └─ 有新东西 → 写 inbox → 直接投递一条通知进你的会话 ← 投递就是唤醒你
+  └─ 有新东西 → 写 inbox + 刷新 wake → 叫醒器退出 ← 退出就是唤醒你
 ```
 
-默认用 `--relay`:循环有事时起一个只开放 SendMessage 的 `claude -p` 短进程,按会话名把通知
-投递进你所在的 Desktop 会话,然后接着轮询。所以「什么时候该叫醒 agent」这个判断在 shell 里
-免费执行,也不用在 harness 里挂一个叫醒器、每 2 小时重挂一次。老办法(`run_in_background`
-加退出码)还在,见第 3 步末尾。
+默认是守护循环加叫醒器:循环用 nohup 脱离 harness 长跑,叫醒器 `watch-wait.sh` 用
+`run_in_background` 挂在会话里,有事就退出,harness 把退出码交给你。所以「什么时候该叫醒
+agent」这个判断在 shell 里免费执行。另有一个可选的直接投递模式(`--relay`),有已知限制,
+见第 3 步末尾。
 
 ## 为什么是这个形状
 
@@ -96,39 +96,7 @@ scripts/watch-loop.sh --name <名字> --probe <probe路径> --seed
 
 不 seed 的话首轮会把全部历史当成新增,白叫醒你一次。
 
-### 3. 启动循环(默认:直接投递模式,跑 3 天)
-
-```bash
-REPO=owner/repo PR=1234 SELF=your-login \
-WATCH_TARGET_SESSION_LINK="claude://claude.ai/epitaxy/local_<会话 id>" \
-  nohup ~/.claude/skills/incremental-watch/scripts/watch-loop.sh \
-    --name pr-1234 \
-    --probe ~/.claude/skills/incremental-watch/scripts/templates/probe-github-pr.sh \
-    --interval 120 --relay >/dev/null 2>&1 & disown
-```
-
-- `WATCH_TARGET_SESSION_LINK` 填你当前会话的链接(会话元数据里的 `link`)。每次投递前按链接末尾的
-  `local_<id>` 在 `~/.claude/sessions/*.json` 里找到这个会话活着的进程,投到它的 `uds:` socket 地址,
-  所以会话改标题不影响投递。也可以只配 `WATCH_TARGET_SESSION_ID=local_<id>`
-- Desktop 会因空闲超时或内存压力停掉会话进程,这时按 id 找不到活进程,脚本先 `open` 链接把会话
-  拉起来,等 `WATCH_WAKE_WAIT` 秒再找、再投一次
-- `WATCH_TARGET_SESSION`(会话标题)是备选:没配 id,或按 id 找不到活进程时才用。标题要唯一,
-  **不能有括号和 @**(半角全角都算),SendMessage 解析不了,循环启动时直接拒绝;Desktop 会自己
-  改标题,一改就投不到
-- 还是投不出去(会话归档,或 Desktop 没开),通知进 `relay-pending.json`,之后每轮轮询
-  时重投(间隔不短于 `WATCH_RELAY_RETRY`,默认 60 秒),攒下的多条合并成一次投递。inbox
-  本身不丢,晚投只是晚,不漏项
-- 循环要退出前(terminal、跑满 max-runtime、致命错误)会一直重投到成功才退出;被 TERM/INT/HUP
-  杀掉时尽力补投一条 loop-exit。SIGKILL 什么都发不出去
-- 想先确认投得到:`scripts/watch-relay.sh --name <名字> --signals '[{"kind":"new-items"}]'`,
-  你会收到一条通知
-
-收到的通知只有 watch 名、事件种类、inbox 项数和文件路径,不含任何一项的内容,外部源里夹带的
-指令不会经这条路进到你的会话。
-
-#### 不能用直接投递时:守护循环加叫醒器
-
-没有 Desktop 会话可投(比如纯 CLI),就用下面这套退出码的办法。
+### 3. 启动循环(默认:守护循环 + 叫醒器,跑 3 天)
 
 Claude Code 的后台 Bash 最多活 **2 小时**(`timeout` 上限 7200000ms),到点被 harness 直接杀掉
 (状态是 killed,不是 exit 13,锁也不释放)。要盯几天的东西,循环就不能挂在 harness 下面。
@@ -159,6 +127,45 @@ REPO=owner/repo PR=1234 SELF=your-login \
 
 不需要跑那么久、几十分钟就有结论的(等 CI、等部署),也可以照旧不加 `--daemon`、直接
 `run_in_background` 跑 `watch-loop.sh`,`--max-runtime` 给到 ≤6400(留出余量,不然会被 2 小时上限杀掉)。
+
+#### 可选:直接投递(`--relay`,默认不用)
+
+**已知限制:权限模式不一致时通知会卡住,而且循环不知道。** 投递方是一个
+`claude -p --permission-mode auto` 进程。目标会话的权限模式跟它不一样(比如会话开着 bypass)时,
+Desktop 不把消息交给会话,而是挂在会话里等人点批准(提示 `held — waiting for approval`,
+`the sender's permission mode differs`)。这时 SendMessage 对发送方照样返回成功,循环记一条
+「已投递」,不会再重投,人不在电脑前时这条通知就一直卡着。2026-11-04 实测:会话是 bypass 时
+auto 发送方的通知全部卡住;把发送方换成 bypass 后,会话空闲时也能在约 10 秒内被叫醒。
+会话登记文件里没有权限模式字段,脚本没法自动对齐;投递用的模式目前写死在 `watch-relay.sh` 里。
+所以只在能确定目标会话权限模式就是 auto、而且不会中途切换时才用 `--relay`,其余情况用上面的叫醒器。
+
+```bash
+REPO=owner/repo PR=1234 SELF=your-login \
+WATCH_TARGET_SESSION_LINK="claude://claude.ai/epitaxy/local_<会话 id>" \
+  nohup ~/.claude/skills/incremental-watch/scripts/watch-loop.sh \
+    --name pr-1234 \
+    --probe ~/.claude/skills/incremental-watch/scripts/templates/probe-github-pr.sh \
+    --interval 120 --relay >/dev/null 2>&1 & disown
+```
+
+- `WATCH_TARGET_SESSION_LINK` 填你当前会话的链接(会话元数据里的 `link`)。每次投递前按链接末尾的
+  `local_<id>` 在 `~/.claude/sessions/*.json` 里找到这个会话活着的进程,投到它的 `uds:` socket 地址,
+  所以会话改标题不影响投递。也可以只配 `WATCH_TARGET_SESSION_ID=local_<id>`
+- Desktop 会因空闲超时或内存压力停掉会话进程,这时按 id 找不到活进程,脚本先 `open` 链接把会话
+  拉起来,等 `WATCH_WAKE_WAIT` 秒再找、再投一次
+- `WATCH_TARGET_SESSION`(会话标题)是备选:没配 id,或按 id 找不到活进程时才用。标题要唯一,
+  **不能有括号和 @**(半角全角都算),SendMessage 解析不了,循环启动时直接拒绝;Desktop 会自己
+  改标题,一改就投不到
+- 还是投不出去(会话归档,或 Desktop 没开),通知进 `relay-pending.json`,之后每轮轮询
+  时重投(间隔不短于 `WATCH_RELAY_RETRY`,默认 60 秒),攒下的多条合并成一次投递。inbox
+  本身不丢,晚投只是晚,不漏项
+- 循环要退出前(terminal、跑满 max-runtime、致命错误)会一直重投到成功才退出;被 TERM/INT/HUP
+  杀掉时尽力补投一条 loop-exit。SIGKILL 什么都发不出去
+- 想先确认投得到:`scripts/watch-relay.sh --name <名字> --signals '[{"kind":"new-items"}]'`,
+  你会收到一条通知
+
+收到的通知只有 watch 名、事件种类、inbox 项数和文件路径,不含任何一项的内容,外部源里夹带的
+指令不会经这条路进到你的会话。
 
 启动后告诉用户三件事:盯的是什么、多久查一次、什么情况会叫醒你。别让人猜。
 
