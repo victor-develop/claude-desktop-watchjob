@@ -14,6 +14,11 @@
 投递内容由本脚本按模板拼:类型、发送人、channel、ts、链接和初判理由,不带消息原文,
 消息里夹带的指令到不了目标会话;会话自己用 Slack 工具去读原文。
 
+可选的自动回复(默认关):配了 AUTO_REPLY_CHANNELS_FILE 才开。名单里的 channel 被直接 @我,或者名单里的私聊,
+投递说明会授权会话读完线程后回到原线程;需要我拍板、要做写操作或信息不足时只起草。
+只配名单时用 Slack MCP 的 slack_send_message 发;再配了 AUTO_REPLY_BYLINE 时改用 slk-reply.mjs 调 chat.postMessage,
+回复带小字署名,监听按同一个署名跳过它,以免循环。只配署名不配名单时启动报错。
+
 配置全部走环境变量,见 references/slack-live.md。
 """
 
@@ -39,6 +44,7 @@ API_CMD = shlex.split(os.environ.get("SLACK_LIVE_API_CMD", f"node {shlex.quote(o
 WS_CMD = shlex.split(os.environ.get("SLACK_LIVE_WS_CMD", f"node {shlex.quote(os.path.join(HERE, 'slk-ws.mjs'))}"))
 RELAY_CMD = os.environ.get("WATCH_RELAY_CMD", os.path.join(os.path.dirname(HERE), "watch-relay.sh"))
 CLAUDE_CMD = shlex.split(os.environ.get("SLACK_LIVE_CLAUDE", "claude"))
+REPLY_HELPER = os.path.join(HERE, "slk-reply.mjs")
 
 TRIAGE_MODEL = os.environ.get("TRIAGE_MODEL", "haiku")
 BACKFILL_SECONDS = int(os.environ.get("BACKFILL_SECONDS", "300"))
@@ -49,6 +55,9 @@ SKIP_ATTACHMENT_KEYWORDS = [k.strip() for k in os.environ.get("SKIP_ATTACHMENT_K
 # 和 templates/probe-slack.sh 同一套约定:agent 用你本人账号发言时带的前缀,带前缀的自己的消息不当成新消息
 AGENT_MARK = os.environ.get("AGENT_MARK", "")
 AGENT_MARK_RE = re.compile(os.environ["AGENT_MARK_RE"]) if os.environ.get("AGENT_MARK_RE") else None
+# 自动回复的两项都没有默认值:名单决定开不开,署名决定走 MCP 还是 API
+AUTO_REPLY_CHANNELS_FILE = os.path.expanduser(os.environ.get("AUTO_REPLY_CHANNELS_FILE", "").strip())
+AUTO_REPLY_BYLINE = os.environ.get("AUTO_REPLY_BYLINE", "").strip()
 SEEN_CAP = 500
 GROUPS_REFRESH_SECONDS = 3600
 THREAD_CONTEXT_MESSAGES = 8
@@ -59,6 +68,18 @@ def log(msg):
     print(line, flush=True)
     with open(LOG_FILE, "a") as f:
         f.write(line + "\n")
+
+
+def auto_reply_channels():
+    """每次投递前现读,改名单不用重启。一行一个 channel id,# 后面是注释。"""
+    if not AUTO_REPLY_CHANNELS_FILE:
+        return set()
+    try:
+        with open(AUTO_REPLY_CHANNELS_FILE) as f:
+            return {line.split("#", 1)[0].strip() for line in f} - {""}
+    except FileNotFoundError:
+        log(f"自动回复名单文件不存在,本条只起草: {AUTO_REPLY_CHANNELS_FILE}")
+        return set()
 
 
 def slack(method, **params):
@@ -270,13 +291,34 @@ def follow_thread(msg, state):
 def build_note(msg, reason):
     sender = msg.get("username") or msg.get("user", "")
     channel_id = (msg.get("channel") or {}).get("id", "")
-    return (
+    note = (
         "这是用户本人的 Slack 监听转来的消息,用户要你替他处理:先用 Slack 工具读原文和完整线程,"
-        "再给用户一个结论(要他做什么、回复草稿,或者不用处理并说明原因)。不要发 Slack 消息,不要改文件。\n"
+        "再给用户一个结论(要他做什么、回复草稿,或者不用处理并说明原因)。\n"
         f"【Slack 触发】{describe(msg)} 来自 {sender},channel {channel_id},ts {msg.get('ts', '')}\n"
         f"链接:{msg.get('permalink', '')}\n"
-        f"初判理由:{reason}"
+        f"初判理由:{reason}\n"
     )
+    # 只有直接 @我(@组不算)或私聊才授权;thread 后续、@组的消息一律只起草
+    if (msg.get("_direct") or is_dm(msg)) and channel_id in auto_reply_channels():
+        fallback = "需要用户拍板、需要做写操作或信息不足以回答时不要发,改为起草一版给用户看。"
+        if AUTO_REPLY_BYLINE:
+            env = {"AUTO_REPLY_BYLINE": AUTO_REPLY_BYLINE}
+            if os.environ.get("SLKCLI_DIR"):
+                env["SLKCLI_DIR"] = os.environ["SLKCLI_DIR"]
+            prefix = " ".join(f"{k}={shlex.quote(v)}" for k, v in env.items())
+            return note + (
+                "这个 channel 已授权自动回复:读完链接所在的完整线程后,用 Bash 执行下面的命令发到原线程,"
+                "把 <正文> 换成回复正文(Markdown,脚本会转成 Slack 格式并加上小字署名,正文里不要再写署名):\n"
+                f"{prefix} node {shlex.quote(REPLY_HELPER)} {channel_id} {thread_ts_of(msg)} <<'SLACK_REPLY_EOF'\n"
+                "<正文>\nSLACK_REPLY_EOF\n"
+                "只发这一条回复,不做其他写操作,不改文件;发完把脚本输出的 permalink 给用户。" + fallback
+            )
+        return note + (
+            "这个 channel 已授权自动回复:读完链接所在的完整线程后,用 Slack MCP 的 slack_send_message 回到原线程,"
+            f"channel_id 填 {channel_id},thread_ts 填 {thread_ts_of(msg)};回复里不要 @用户本人。"
+            "只发这一条回复,不做其他写操作,不改文件;发完把消息链接给用户。" + fallback
+        )
+    return note + "需要回复就起草一版给用户看。不要发 Slack 消息,不要改文件。"
 
 
 def relay(msg, reason):
@@ -349,8 +391,8 @@ def screen(msg, me_id, groups, started_at, threads=None):
         return False  # 启动之前的历史消息只记账不触发
     text = msg.get("text") or ""
     if msg.get("user") == me_id:
-        # 我自己的消息只收 @我自己 的;agent 以我的账号发的消息带前缀,跳过以免循环
-        if f"<@{me_id}>" not in text or is_agent_message(text):
+        # 我自己的消息只收 @我自己 的;agent 以我的账号发的消息带前缀、自动回复以署名开头,都跳过以免循环
+        if f"<@{me_id}>" not in text or is_agent_message(text) or (AUTO_REPLY_BYLINE and text.startswith(AUTO_REPLY_BYLINE)):
             return False
         msg["_self"] = True
     attachment_text = " ".join(
@@ -460,6 +502,9 @@ def main():
     # --exit-on-eof:事件流读完就退出,不重启 slk-ws。用来回放一段录下来的事件,也是测试的入口
     exit_on_eof = "--exit-on-eof" in sys.argv[1:]
     os.makedirs(STATE_DIR, exist_ok=True)
+    if AUTO_REPLY_BYLINE and not AUTO_REPLY_CHANNELS_FILE:
+        print("配了 AUTO_REPLY_BYLINE 但没配 AUTO_REPLY_CHANNELS_FILE:署名只用在名单里的自动回复上,不配名单就没有地方用", file=sys.stderr)
+        sys.exit(1)
     check = subprocess.run([RELAY_CMD, "--check"], capture_output=True, text=True)
     if check.returncode != 0:
         print(f"投递配置不对: {check.stderr.strip()}", file=sys.stderr)
@@ -472,7 +517,9 @@ def main():
 
     me_id, me_name = identity["user_id"], identity["user"]
     queries = [os.environ.get("SLACK_QUERY", f"@{me_name}"), "to:me"]
-    log(f"启动:me={me_id} ({me_name}) queries={queries!r} backfill={BACKFILL_SECONDS}s")
+    auto_reply = (f"开,名单 {AUTO_REPLY_CHANNELS_FILE},经 {'API 带署名' if AUTO_REPLY_BYLINE else 'Slack MCP'}"
+                  if AUTO_REPLY_CHANNELS_FILE else "关")
+    log(f"启动:me={me_id} ({me_name}) queries={queries!r} backfill={BACKFILL_SECONDS}s 自动回复={auto_reply}")
 
     state = load_state()
     groups, groups_loaded_at = {}, 0.0

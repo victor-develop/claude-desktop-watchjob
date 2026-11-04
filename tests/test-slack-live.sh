@@ -6,7 +6,8 @@
 #
 # 覆盖:本地过滤(私聊 / @我 / @我所在的组 / 投递过的 thread 后续 / 自己 / 带 AGENT_MARK 的自己 / 跳过名单 / 改消息)、
 #       真人私聊不初判、初判说不用就不投、投递内容不带原文、search 补拉和实时通道去重、
-#       投递失败排队并在下次启动时重投、启动时校验投递配置。
+#       投递失败排队并在下次启动时重投、启动时校验投递配置、
+#       可选的自动回复(默认关、两项配置缺一不可、只授权名单里直接 @我 和私聊、按署名防循环)。
 
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -122,6 +123,7 @@ check "改消息事件不处理" '[ "$(triaged "改过的消息")" = 0 ]'
 check "投递说明不带消息原文" '! grep -q "帮看下这个问题" "$CALLS"'
 check "初判带上了 thread 前文" 'grep -q "根消息" "$TRIAGE_LOG"'
 check "投递说明要求只分析、不发消息" 'grep -q "不要发 Slack 消息" "$CALLS"'
+check "自动回复默认关:说明里没有发送授权" '! grep -q "已授权自动回复" "$CALLS"'
 check "seen 记下了处理过的 ts" 'jq -e ".seen | index(\"9000000004.000100\")" "$T/st/state.json" >/dev/null'
 
 echo "== 投递失败:排队,下次启动时重投 =="
@@ -143,6 +145,51 @@ EOF
 chmod +x "$T/relay-bad"
 rc=$(WATCH_RELAY_CMD="$T/relay-bad" python3 "$LIVE" --exit-on-eof >/dev/null 2>&1; echo $?)
 check "投递配置不对时直接退出 1" '[ "$rc" = 1 ]'
+rc=$(AUTO_REPLY_BYLINE="[bot]" python3 "$LIVE" --exit-on-eof >/dev/null 2>&1; echo $?)
+check "只配署名、没配名单 → 退出 1" '[ "$rc" = 1 ]'
+
+echo "== 可选的自动回复 =="
+printf 'C1  # 允许自动回复的频道\nD1\n' > "$T/auto-reply"
+: > "$CALLS"; : > "$T/search.json"
+BYLINE=":speech_balloon: 代答"
+{
+  ev C1 9000000030.000100 UBOB "<@UME> NEED-YES 名单里的频道直接 @我"
+  ev C1 9000000031.000100 UBOB "<!subteam^S1> NEED-YES 名单里的频道 @组"
+  ev D1 9000000032.000100 UBOB "名单里的私聊"
+  ev C2 9000000033.000100 UBOB "<@UME> NEED-YES 不在名单里的频道"
+  ev C1 9000000034.000100 UBOB "NEED-YES 名单频道里的 thread 后续" '{"thread_ts":"9000000030.000100"}'
+  ev C1 9000000035.000100 UME  "$BYLINE
+回复里提到 <@UME>"
+} > "$T/events"
+note_of() { awk -v ts="ts $1" '$0 ~ ts {p=1} p {print} /^=====$/ {p=0}' "$CALLS"; }
+
+echo "-- 只配名单:走 Slack MCP"
+AUTO_REPLY_CHANNELS_FILE="$T/auto-reply" SLACK_LIVE_STATE_DIR="$T/st-mcp" python3 "$LIVE" --exit-on-eof >/dev/null 2>&1
+check "名单频道直接 @我 → 授权用 slack_send_message 回原线程" 'note_of 9000000030.000100 | grep -q "slack_send_message" && note_of 9000000030.000100 | grep -q "channel_id 填 C1,thread_ts 填 9000000030.000100"'
+check "MCP 路径不带回复脚本" '! note_of 9000000030.000100 | grep -q slk-reply'
+check "名单私聊 → 授权" 'note_of 9000000032.000100 | grep -q "channel_id 填 D1"'
+check "授权说明里写明拍板、写操作、信息不足时只起草" 'note_of 9000000030.000100 | grep -q "改为起草一版"'
+check "名单频道里 @组 → 只起草" 'note_of 9000000031.000100 | grep -q "不要发 Slack 消息" && ! note_of 9000000031.000100 | grep -q 已授权'
+check "不在名单的频道 → 只起草" '! note_of 9000000033.000100 | grep -q 已授权'
+check "thread 后续 → 只起草" '[ "$(delivered 9000000034.000100)" = 1 ] && ! note_of 9000000034.000100 | grep -q 已授权'
+
+echo "-- 名单加署名:走 API"
+: > "$CALLS"
+AUTO_REPLY_CHANNELS_FILE="$T/auto-reply" AUTO_REPLY_BYLINE="$BYLINE" SLACK_LIVE_STATE_DIR="$T/st-ar" \
+  python3 "$LIVE" --exit-on-eof >/dev/null 2>&1
+check "名单频道直接 @我 → 给 slk-reply.mjs 命令,带同一个署名" 'note_of 9000000030.000100 | grep -q "slk-reply.mjs C1 9000000030.000100" && note_of 9000000030.000100 | grep -qF "AUTO_REPLY_BYLINE='"'"':speech_balloon: 代答'"'"'"'
+check "API 路径不让会话用 MCP 发" '! note_of 9000000030.000100 | grep -q slack_send_message'
+check "名单私聊 → slk-reply.mjs" 'note_of 9000000032.000100 | grep -q "slk-reply.mjs D1"'
+check "名单频道里 @组 → 只起草" '! note_of 9000000031.000100 | grep -q 已授权'
+check "以署名开头的自己的消息不处理(防循环)" '[ "$(delivered 9000000035.000100)" = 0 ]'
+
+echo "-- slk-reply.mjs 缺署名、参数不对时在读凭据前退出"
+rc=$(echo hi | node scripts/slack-live/slk-reply.mjs C1 >/dev/null 2>&1; echo $?)
+check "没配署名 → 退出 2" '[ "$rc" = 2 ]'
+rc=$(echo hi | AUTO_REPLY_BYLINE=x node scripts/slack-live/slk-reply.mjs bad-channel >/dev/null 2>&1; echo $?)
+check "channel 不合法 → 退出 2" '[ "$rc" = 2 ]'
+rc=$(printf '' | AUTO_REPLY_BYLINE=x node scripts/slack-live/slk-reply.mjs C1 >/dev/null 2>&1; echo $?)
+check "正文为空 → 退出 2" '[ "$rc" = 2 ]'
 
 echo
 echo "  通过 $PASS  失败 $FAIL"

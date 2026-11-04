@@ -67,6 +67,33 @@ cd scripts/slack-live && npm install --ignore-scripts   # slkcli@0.2.0 和 ws@8.
 | `SLACK_QUERY` | `@<你的 handle>` | 补拉 @我 用的搜索语句;私聊固定另搜 `to:me` |
 | `AGENT_MARK` / `AGENT_MARK_RE` | 空 | agent 用你本人账号发言时带的前缀(字面 startswith / 正则),和 `templates/probe-slack.sh` 同一套约定。你自己发的、@了自己的消息会被收下投递,带这个前缀的除外,免得 agent 代你发的消息又把自己叫醒 |
 | `SLKCLI_DIR` | 空 | 用本地 slkcli checkout 代替 npm 包 |
+| `AUTO_REPLY_CHANNELS_FILE` | 空 | 可选的自动回复:允许自动回复的名单文件,配了就开,见下一节 |
+| `AUTO_REPLY_BYLINE` | 空 | 可选的自动回复:配了就改走 API 发带署名的回复,署名同时是监听跳过自动回复的依据。只配它、不配名单时启动报错 |
+
+## 可选的自动回复(默认关)
+
+不配就没有这一步:投递说明只让目标会话读线程、分析、起草,不发 Slack 消息。
+
+配了 `AUTO_REPLY_CHANNELS_FILE` 之后:
+
+- **只在两种情况下授权:** 名单里的 channel 有人直接 @我(正文含 `<@我>`,@组不算),或者名单里的私聊
+  (私聊的 channel id 以 `D` 开头)。@组的消息、投递过的 thread 里的后续消息、名单外的 channel,一律只起草。
+- **需要你拍板、要做写操作或信息不足以回答时不发**,改为起草给你看。这条写在授权说明里,由会话执行。
+- **发送方式由 `AUTO_REPLY_BYLINE` 决定:**
+
+| 配置 | 怎么发 | 防循环 |
+|---|---|---|
+| 只配名单 | 目标会话用 Slack MCP 的 `slack_send_message`(带原消息的 `thread_ts`)回到原线程,和会话平时回 Slack 走同一个工具。目标会话要连着 Slack MCP | 自动回复是你本人账号发的消息,监听只收 @了你自己的那种,说明里要求回复不 @你本人;配了 `AGENT_MARK` 时也按它跳过 |
+| 名单加署名 | 目标会话用 Bash 执行 `scripts/slack-live/slk-reply.mjs`,经 slkcli 调 `chat.postMessage`。第一块是 context block,显示成小号灰字的署名,正文按 Markdown 转成 `rich_text` | 消息的 `text` 以署名开头,监听遇到「我自己发的、以署名开头」的消息就跳过。署名和防循环用同一个 `AUTO_REPLY_BYLINE`,投递说明里的命令会带上它 |
+
+- **名单文件**一行一个 channel id,`#` 后面是注释,每次投递前现读,改了不用重启。
+
+```
+C0XXXXXXXXX   # 团队频道
+D0XXXXXXXXX   # 和某人的私聊
+```
+
+自动回复以你本人的账号发出,别人看到的是你发的消息(走 API 时再加一行小字署名)。开之前想清楚名单里每个 channel 能接受这种回复。
 
 ## 运行
 

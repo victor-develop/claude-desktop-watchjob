@@ -128,7 +128,11 @@ worth handling is delivered into a Claude Desktop session through `watch-relay.s
 The notice carries sender, channel, timestamp, link and the triage reason, never the message text.
 
 All personal settings are environment variables (target session, permission mode, skip lists,
-agent prefix, state directory). Slack access goes through
+agent prefix, state directory). Optional auto-reply is off by default: with an allowlist of channels
+configured, the session may reply, as you, in an allowlisted channel where you were mentioned directly
+or in an allowlisted DM. With the allowlist alone it replies through the Slack MCP `slack_send_message`;
+adding a byline switches it to `chat.postMessage` via `slk-reply.mjs`, and the same byline marks those
+replies so the listener skips them. Slack access goes through
 [slkcli](https://github.com/therohitdas/slkcli), which reads the Slack desktop app's session on
 macOS; tokens stay inside it. Setup, configuration and limits are in
 [`references/slack-live.md`](references/slack-live.md).
@@ -258,7 +262,7 @@ judgment call.
 ./tests/test-ack.sh             # 21 assertions: watch-ack contract, lock takeover, no lost items when racing the loop
 ./tests/test-slack-modes.sh     # 51 assertions: the three Slack modes, thread-reply pickup, cursor, skipped unchanged threads
 ./tests/test-relay.sh           # 38 assertions: --relay delivery, queue and retry, delivery before exit, id lookup, wake via link, permission mode, --note-file
-./tests/test-slack-live.sh      # 28 assertions: slack-live filtering, triage skip rules, backfill dedup, agent prefix, retry after restart
+./tests/test-slack-live.sh      # 45 assertions: slack-live filtering, triage skip rules, backfill dedup, agent prefix, retry after restart, opt-in auto-reply (Slack MCP or API)
 ./tests/test-timeout.sh         #  6 assertions: run_with_timeout without timeout(1) kills the whole process group
 ```
 
