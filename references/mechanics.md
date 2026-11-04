@@ -98,3 +98,19 @@ homebrew 装的东西全都找不到。
 唯一不告警的失效方式是**probe 挂死**(比如 `curl` 没设超时)。所以 probe 里所有网络调用
 都要有超时。同理,probe 里多个子请求的退出码要逐个检查 —— 拿到半截数据却当成功返回,
 游标照推,丢掉的那条就再也不会出现了。
+
+## 直接投递:`claude -p` + SendMessage
+
+在 claude-code 2.1.308 上,可以从 CLI 按会话名把消息投递进一个正在运行的 Desktop 会话。`--relay`
+就建立在这上面。实测(2026-11-03,macOS):
+
+| 观察 | 数据 |
+|---|---|
+| 投递可用 | `claude -p --tools SendMessage --permission-mode auto` 按会话标题投递,约 11 秒,目标会话收到原文 |
+| 进程不在时投不到 | (来自一个常驻 Slack 投递脚本的实际使用,不是本仓库的测试)Desktop 会因空闲超时或内存压力停掉会话进程,这时按名字找不到;`open claude://claude.ai/epitaxy/local_<id>` 能把它拉起来,之后重投成功 |
+| 会话名有限制 | (同上)名字含括号或 `@` 时 SendMessage 解析失败 |
+| 不认 local_ id | `claude -p` 里 SendMessage 的 to 填 `local_<id>` 返回「没有可达的 agent」;它的 ListAgents 只列会话标题和一个短 ref |
+| 认 uds 地址 | `~/.claude/sessions/<pid>.json` 里有 `hostSessionId`(即 local_ id)、当前标题和 `messagingSocketPath`;to 填 `uds:<messagingSocketPath>` 投递成功(claude-code 2.1.309 写的登记文件) |
+| 不依赖 harness 后台任务 | 投递方是任意本机进程,所以循环可以 nohup 长跑,不用叫醒器、不用 2 小时重挂 |
+
+这条通道的代价是每次投递一次小模型调用;正文由脚本拼好,模型只负责调工具,不读 inbox 内容。

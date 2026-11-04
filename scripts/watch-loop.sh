@@ -15,6 +15,11 @@
 #   --daemon            守护模式:有新增项只写 inbox + 刷新 <state>/wake,不退出,继续轮询;
 #                       probe 出错只记 log、下一轮重试,连续失败 3 次(WATCH_DAEMON_FAIL_ALERT)才写 signal + 刷新 wake。用 nohup 脱离 harness 启动,
 #                       再用 watch-wait.sh(run_in_background)等 wake 叫醒 agent
+#   --relay             直接投递模式(隐含 --daemon):有事时用 watch-relay.sh 把通知直接投递进
+#                       WATCH_TARGET_SESSION_LINK 指定的 Desktop 会话,不需要 watch-wait.sh。投递失败的通知
+#                       落 <state>/relay-pending.json,每轮轮询时重投(间隔不短于 WATCH_RELAY_RETRY 秒,默认 60)。
+#                       terminal、max-runtime、致命错误这类退出前的通知会一直重投到成功才退出。
+#                       目标会话、唤醒链接等配置见 watch-relay.sh 顶部注释
 #   --backoff           连续无事时间隔翻倍,上限 interval*8。适合低频源
 #   --active HH-HH      只在这个小时区间内轮询,窗口外空转(不算轮次),如 10-18
 #   --active-days D-D   只在这些星期内轮询(1=周一),如 1-5
@@ -49,7 +54,7 @@ set -uo pipefail
 # 追加而不是前置 —— 调用方指定的 PATH 优先
 export PATH="$PATH:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
-NAME=""; PROBE=""; INTERVAL=120; MAX_RUNTIME=259200; BACKOFF=0; DAEMON=0
+NAME=""; PROBE=""; INTERVAL=120; MAX_RUNTIME=259200; BACKOFF=0; DAEMON=0; RELAY=0
 ACTIVE_HOURS=""; ACTIVE_DAYS=""; SEED=0; STATE_DIR=""
 
 while [ $# -gt 0 ]; do
@@ -60,6 +65,7 @@ while [ $# -gt 0 ]; do
     --max-runtime) MAX_RUNTIME="$2"; shift 2 ;;
     --backoff)     BACKOFF=1; shift ;;
     --daemon)      DAEMON=1; shift ;;
+    --relay)       RELAY=1; DAEMON=1; shift ;;
     --active)      ACTIVE_HOURS="$2"; shift 2 ;;
     --active-days) ACTIVE_DAYS="$2"; shift 2 ;;
     --seed)        SEED=1; shift ;;
@@ -85,6 +91,15 @@ done
 [ -n "$PROBE" ] || { echo "--probe required" >&2; exit 1; }
 [ -x "$PROBE" ] || { echo "probe not executable: $PROBE" >&2; exit 1; }
 
+RELAY_CMD="${WATCH_RELAY_CMD:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/watch-relay.sh}"
+RELAY_RETRY="${WATCH_RELAY_RETRY:-60}"
+if [ "$RELAY" = "1" ] && [ "$SEED" = "0" ]; then
+  [ -x "$RELAY_CMD" ] || { echo "投递脚本不可执行: $RELAY_CMD" >&2; exit 1; }
+  # 配置错了要在启动时报,而不是等到第一次有事、投递一直失败才发现
+  "$RELAY_CMD" --check || exit 1
+  case "$RELAY_RETRY" in ''|*[!0-9]*|0) echo "WATCH_RELAY_RETRY 必须是正整数,收到: '$RELAY_RETRY'" >&2; exit 1 ;; esac
+fi
+
 # NAME 会拼进状态目录路径,而脚本会往里写文件、递归删 lock —— 必须是单个安全的路径组件,
 # 否则 --name '../../x' 能把写入和删除逃逸到任意目录
 [[ "$NAME" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] \
@@ -93,7 +108,7 @@ done
 STATE_DIR="${STATE_DIR:-$HOME/.claude/watch/$NAME}"
 mkdir -p "$STATE_DIR"
 CURSOR_F="$STATE_DIR/cursor"; CURSOR_IDS="$STATE_DIR/cursor_ids"; INBOX="$STATE_DIR/inbox.json"
-SIGNAL="$STATE_DIR/signal.json"
+SIGNAL="$STATE_DIR/signal.json"; RELAY_PENDING="$STATE_DIR/relay-pending.json"
 LOG="$STATE_DIR/log"; LOCK="$STATE_DIR/lock"; META="$STATE_DIR/meta.json"; WAKE="$STATE_DIR/wake"
 
 log() { echo "[$(date '+%F %T')] $*" >> "$LOG"; }
@@ -101,7 +116,7 @@ log() { echo "[$(date '+%F %T')] $*" >> "$LOG"; }
 # inbox 的锁和原子写,和 watch-ack.sh 共用一份实现
 # shellcheck source=inbox-lock.sh
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/inbox-lock.sh"
-INBOX_LOCKED=0
+INBOX_LOCKED=0; RELAY_ARMED=0; RELAY_FINAL_SENT=0
 
 # 同名 watch 只允许一个循环,否则两个都在推游标、事件会互相吃掉。
 # 接管过期锁必须原子:直接 rm -rf + mkdir 的话,两个启动者可能都判定旧 pid 已死,
@@ -125,8 +140,6 @@ if ! mkdir "$LOCK" 2>/dev/null; then
   log "接管过期锁 (原 pid $holder)"
 fi
 echo $$ > "$LOCK/pid"
-# 释放只删自己的锁:长轮次结束时锁可能已被合法接管,不能连别人的一起删
-trap '[ "$INBOX_LOCKED" = "1" ] && inbox_unlock "$STATE_DIR"; [ "$(cat "$LOCK/pid" 2>/dev/null)" = "$$" ] && rm -rf "$LOCK"' EXIT
 # 写完 pid 再验一次所有权:极端交错下(慢一步的接管者刚好在上面两步之间通过了死锁判定)
 # 自己的新锁可能被移走。settle 一拍后 pid 不是自己 → 退出,让对方独占
 sleep 1
@@ -141,6 +154,7 @@ sleep 1
 emit_signal_and_exit() {  # $1=exit_code  $2=json对象
   printf '%s\n' "$2" > "$SIGNAL"
   touch "$WAKE"
+  relay_final "$2"
   log "exit $1 (signal), inbox 保持不动"
   exit "$1"
 }
@@ -150,16 +164,83 @@ emit_signal_and_exit() {  # $1=exit_code  $2=json对象
 emit_data_and_exit() {  # $1=exit_code  $2=json数组(只用来记日志)  $3=signal对象
   printf '%s\n' "$3" > "$SIGNAL"
   touch "$WAKE"
+  relay_final "$3"
   log "exit $1, inbox $(printf '%s' "$2" | jq -c 'length') 项"
   exit "$1"
 }
 
 # 守护模式下的「叫醒」:写 signal、刷新 wake 文件,但不退出 —— 由 watch-wait.sh 去叫 agent(inbox 已在 merge 那步写好)
 emit_data_and_continue() {  # $1=json数组(只用来记日志)  $2=signal对象
-  printf '%s\n' "$2" > "$SIGNAL"
-  touch "$WAKE"
+  daemon_alert "$2"
   log "inbox $(printf '%s' "$1" | jq -c 'length') 项,已刷新 wake,继续轮询"
 }
+
+# 守护模式下不退出的告警:写 signal、刷新 wake;--relay 时再投递一次
+daemon_alert() {  # $1=signal对象
+  printf '%s\n' "$1" > "$SIGNAL"
+  touch "$WAKE"
+  [ "$RELAY" = "1" ] && { relay_queue "$1"; relay_flush; }
+  return 0
+}
+
+# ---- 直接投递(--relay) ----
+# inbox 本身就是持久的数据队列,这里只排「要告诉会话哪些事」。多条没投出去的通知合并成一次投递,
+# 投递内容在投递那一刻按当前 inbox 生成,所以晚投不会漏项
+relay_queue() {  # $1=signal对象;排进队列并把下次重投时间清零,让这次有事立刻尝试
+  local old; old=$(cat "$RELAY_PENDING" 2>/dev/null)
+  printf '%s' "$old" | jq -e '.signals | type == "array"' >/dev/null 2>&1 || old='{"signals":[]}'
+  jq -cn --argjson o "$old" --argjson s "$1" '$o | .signals = ((.signals + [$s]) | .[-20:]) | .next_at = 0' \
+    > "$RELAY_PENDING.tmp.$$" && mv -f "$RELAY_PENDING.tmp.$$" "$RELAY_PENDING"
+}
+
+relay_flush() {  # 0 = 没有待投递的,或者刚投递成功;1 = 还没到重投时间,或者投递失败
+  [ -f "$RELAY_PENDING" ] || return 0
+  local p next sigs
+  p=$(cat "$RELAY_PENDING" 2>/dev/null)
+  next=$(printf '%s' "$p" | jq -r '.next_at // 0' 2>/dev/null); case "$next" in ''|*[!0-9]*) next=0 ;; esac
+  [ "$(date +%s)" -ge "$next" ] || return 1
+  sigs=$(printf '%s' "$p" | jq -c '.signals' 2>/dev/null)
+  printf '%s' "$sigs" | jq -e 'type == "array" and length > 0' >/dev/null 2>&1 || { rm -f "$RELAY_PENDING"; return 0; }
+  if "$RELAY_CMD" --name "$NAME" --state-dir "$STATE_DIR" --signals "$sigs" >>"$LOG" 2>&1; then
+    rm -f "$RELAY_PENDING"
+    log "已投递 $(printf '%s' "$sigs" | jq -r 'map(.kind) | unique | join(",")') 通知"
+    return 0
+  fi
+  jq -cn --argjson s "$sigs" --argjson t "$(( $(date +%s) + RELAY_RETRY ))" '{signals:$s, next_at:$t}' \
+    > "$RELAY_PENDING.tmp.$$" && mv -f "$RELAY_PENDING.tmp.$$" "$RELAY_PENDING"
+  log "投递失败,${RELAY_RETRY}s 后重投(详情见上面几行)"
+  return 1
+}
+
+# 循环要退出了,之后没人再重投,所以这里一直重投到成功。目标会话一直不可达时循环会停在这里,
+# kill 掉即可,通知留在 relay-pending.json 里
+relay_final() {  # $1=signal对象
+  [ "$RELAY" = "1" ] && [ "$RELAY_ARMED" = "1" ] || return 0
+  # 重投可能要很久,不能一直占着 inbox 锁,否则 watch-ack.sh 全程拿不到锁
+  [ "$INBOX_LOCKED" = "1" ] && { inbox_unlock "$STATE_DIR"; INBOX_LOCKED=0; }
+  RELAY_FINAL_SENT=1
+  relay_queue "$1"
+  until relay_flush; do nap "$RELAY_RETRY"; done
+}
+
+# sleep 放后台再 wait:前台 sleep 期间 bash 会把 TERM 推迟到 sleep 结束才处理
+nap() { sleep "$1" & NAP_PID=$!; wait "$NAP_PID"; NAP_PID=""; }
+NAP_PID=""
+
+on_exit() {  # $1=退出码
+  [ -n "$NAP_PID" ] && kill "$NAP_PID" 2>/dev/null
+  [ "$INBOX_LOCKED" = "1" ] && inbox_unlock "$STATE_DIR"
+  # 没走 emit_* 就退出(被 kill、脚本自身出错)时,尽力投递一次,让会话知道没人在盯了。只投一次、不重试
+  if [ "$RELAY" = "1" ] && [ "$RELAY_ARMED" = "1" ] && [ "$RELAY_FINAL_SENT" = "0" ]; then
+    relay_queue "$(jq -cn --arg n "$NAME" --arg d "退出码 $1" '{kind:"loop-exit", watch:$n, detail:$d}')"
+    relay_flush
+  fi
+  # 释放只删自己的锁:长轮次结束时锁可能已被合法接管,不能连别人的一起删
+  [ "$(cat "$LOCK/pid" 2>/dev/null)" = "$$" ] && rm -rf "$LOCK"
+}
+trap 'on_exit $?' EXIT
+# 默认处置下收到这几个信号会直接死掉、不走 EXIT trap;转成 exit 才能释放锁、发出 loop-exit 通知
+trap 'exit 143' TERM; trap 'exit 130' INT; trap 'exit 129' HUP
 
 bail() {  # probe 或自身出错
   local detail="$1"
@@ -222,10 +303,12 @@ if [ "$SEED" = "1" ]; then
   exit 0
 fi
 
-log "循环启动 pid=$$ interval=${INTERVAL}s max_runtime=${MAX_RUNTIME}s backoff=$BACKOFF daemon=$DAEMON"
+log "循环启动 pid=$$ interval=${INTERVAL}s max_runtime=${MAX_RUNTIME}s backoff=$BACKOFF daemon=$DAEMON relay=$RELAY"
+RELAY_ARMED=1
 started=$(date +%s); cur_interval=$INTERVAL; probe_fails=0; lock_fails=0; DAEMON_FAIL_ALERT=${WATCH_DAEMON_FAIL_ALERT:-3}
 
 while true; do
+  [ "$RELAY" = "1" ] && relay_flush
   now=$(date +%s)
   if [ $((now - started)) -ge "$MAX_RUNTIME" ]; then
     log "跑满 ${MAX_RUNTIME}s,交回 agent 重新拉起"
@@ -242,10 +325,9 @@ while true; do
         probe_fails=$((probe_fails + 1))
         log "probe 失败(守护模式,连续第 ${probe_fails} 次,下一轮重试): $items"
         if [ "$probe_fails" -eq "$DAEMON_FAIL_ALERT" ]; then
-          printf '%s\n' "$(jq -n --arg d "连续 $probe_fails 次 probe 失败: $items" --arg n "$NAME" '{kind:"guard-error", watch:$n, detail:$d}')" > "$SIGNAL"
-          touch "$WAKE"
+          daemon_alert "$(jq -n --arg d "连续 $probe_fails 次 probe 失败: $items" --arg n "$NAME" '{kind:"guard-error", watch:$n, detail:$d}')"
         fi
-        sleep "$cur_interval"
+        nap "$cur_interval"
         continue
       fi
       bail "probe 失败: $items"
@@ -273,10 +355,9 @@ while true; do
           lock_fails=$((lock_fails + 1))
           log "拿不到 inbox 锁(连续第 ${lock_fails} 次),本轮跳过、下一轮重试"
           if [ "$lock_fails" -eq "$DAEMON_FAIL_ALERT" ]; then
-            printf '%s\n' "$(jq -n --arg d "连续 $lock_fails 次拿不到 inbox 锁,看看 $STATE_DIR/inbox.lock 是不是残留" --arg n "$NAME" '{kind:"guard-error", watch:$n, detail:$d}')" > "$SIGNAL"
-            touch "$WAKE"
+            daemon_alert "$(jq -n --arg d "连续 $lock_fails 次拿不到 inbox 锁,看看 $STATE_DIR/inbox.lock 是不是残留" --arg n "$NAME" '{kind:"guard-error", watch:$n, detail:$d}')"
           fi
-          sleep "$cur_interval"; continue
+          nap "$cur_interval"; continue
         fi
         bail "拿不到 inbox 锁(watch-ack.sh 卡住了?),本轮不写 inbox、游标不推进"
       fi
@@ -322,7 +403,7 @@ while true; do
       if [ "$DAEMON" = "1" ]; then
         emit_data_and_continue "$merged" "$sig_new"
         cur_interval=$INTERVAL
-        sleep "$cur_interval"
+        nap "$cur_interval"
         continue
       fi
       log "$n 项新增,唤醒 agent"
@@ -339,5 +420,5 @@ while true; do
     cur_interval=$INTERVAL
   fi
 
-  sleep "$cur_interval"
+  nap "$cur_interval"
 done
