@@ -4,8 +4,8 @@
 #
 #   ./tests/test-slack-live.sh
 #
-# 覆盖:本地过滤(私聊 / @我 / @我所在的组 / 投递过的 thread 后续 / 自己 / 自动回复 / 跳过名单 / 改消息)、
-#       真人私聊不初判、初判说不用就不投、投递内容不带原文、自动回复说明、search 补拉和实时通道去重、
+# 覆盖:本地过滤(私聊 / @我 / @我所在的组 / 投递过的 thread 后续 / 自己 / 带 AGENT_MARK 的自己 / 跳过名单 / 改消息)、
+#       真人私聊不初判、初判说不用就不投、投递内容不带原文、search 补拉和实时通道去重、
 #       投递失败排队并在下次启动时重投、启动时校验投递配置。
 
 set -uo pipefail
@@ -65,8 +65,7 @@ export SLACK_LIVE_API_CMD="$T/api" SLACK_LIVE_WS_CMD="$T/ws" SLACK_LIVE_CLAUDE="
 export SLACK_LIVE_STATE_DIR="$T/st" EVENTS_FILE="$T/events" SEARCH_FILE="$T/search.json"
 export TRIAGE_LOG="$T/triage" CALLS="$T/calls" FAILS_FILE="$T/fails"
 export SKIP_SENDERS="ci-bot" RELAY_RETRY_SECONDS=0 BACKFILL_SECONDS=3600
-export AUTO_REPLY_CHANNELS_FILE="$T/auto-reply" AUTO_REPLY_BYLINE=":robot_face: Auto-reply from agent"
-printf 'C1  # 自动回复的频道\n' > "$T/auto-reply"
+export AGENT_MARK="[agent]" AGENT_MARK_RE='^\[ (:dog:|🐶) Claude:\]'
 
 ev() { local extra="${5:-}"; [ -n "$extra" ] || extra='{}'
   jq -cn --arg ch "$1" --arg ts "$2" --arg user "$3" --arg text "$4" --argjson extra "$extra" \
@@ -91,8 +90,8 @@ EOF
   ev C3 9000000007.000200 UBOB "<!subteam^S2> NEED-YES 别的组"
   ev C4 9000000008.000100 UME  "我自己随便说一句"
   ev C4 9000000009.000100 UME  "<@UME> 提醒自己"
-  ev C4 9000000010.000100 UME  ":robot_face: Auto-reply from agent
-<@UME> 自动回复里提到我"
+  ev C4 9000000010.000100 UME  "[agent] 代我回复,里面提到 <@UME>"
+  ev C4 9000000010.000200 UME  "[ :dog: Claude:] 也提到 <@UME>"
   ev C1 9000000011.000100 UBOB "NEED-YES 没 @ 但在投递过的 thread 里" '{"thread_ts":"9000000004.000100"}'
   ev C1 9000000011.000200 UBOB "NEED-YES 没 @ 在别的 thread 里" '{"thread_ts":"9000000001.000100"}'
   ev C5 9000000012.000100 UX   "<@UME> CI 通知" '{"username":"ci-bot","bot_id":"B1"}'
@@ -114,15 +113,15 @@ check "@我所在的组 → 投递,标出组名" '[ "$(delivered 9000000007.0001
 check "@我不在的组 → 不处理" '[ "$(triaged "别的组")" = 0 ] && [ "$(delivered 9000000007.000200)" = 0 ]'
 check "我自己的普通消息不处理" '[ "$(delivered 9000000008.000100)" = 0 ]'
 check "我 @ 自己 → 不初判直接投" '[ "$(delivered 9000000009.000100)" = 1 ] && [ "$(triaged "提醒自己")" = 0 ]'
-check "自动回复(署名开头)不处理" '[ "$(delivered 9000000010.000100)" = 0 ]'
+check "我账号发的、带 AGENT_MARK 的消息不处理" '[ "$(delivered 9000000010.000100)" = 0 ]'
+check "我账号发的、匹配 AGENT_MARK_RE 的消息不处理" '[ "$(delivered 9000000010.000200)" = 0 ]'
 check "投递过的 thread 后续消息 → 初判后投递" '[ "$(delivered 9000000011.000100)" = 1 ] && grep -q "投递过的 thread 里的后续消息" "$CALLS"'
 check "没投递过的 thread 里没 @ 的消息不处理" '[ "$(triaged "在别的 thread 里")" = 0 ]'
 check "跳过名单里的发送人不处理" '[ "$(triaged "CI 通知")" = 0 ] && [ "$(delivered 9000000012.000100)" = 0 ]'
 check "改消息事件不处理" '[ "$(triaged "改过的消息")" = 0 ]'
 check "投递说明不带消息原文" '! grep -q "帮看下这个问题" "$CALLS"'
 check "初判带上了 thread 前文" 'grep -q "根消息" "$TRIAGE_LOG"'
-check "自动回复名单里的频道:说明里有回复命令和署名" 'grep -q "slk-reply.mjs C1 9000000004.000100" "$CALLS" && grep -q "AUTO_REPLY_BYLINE=" "$CALLS"'
-check "不在名单里的频道:只起草" 'grep -A3 "ts 9000000007.000100" "$CALLS" | grep -q "不要发 Slack 消息"'
+check "投递说明要求只分析、不发消息" 'grep -q "不要发 Slack 消息" "$CALLS"'
 check "seen 记下了处理过的 ts" 'jq -e ".seen | index(\"9000000004.000100\")" "$T/st/state.json" >/dev/null'
 
 echo "== 投递失败:排队,下次启动时重投 =="
