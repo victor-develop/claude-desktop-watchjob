@@ -121,13 +121,14 @@ A separate template for "everything addressed to me on Slack", as opposed to `pr
 polls one channel or thread for one task. It receives messages over Slack's RTM WebSocket (pushed,
 a second or two after they are sent), backfills with `search.messages` after reconnects, and filters
 locally: DMs, messages that mention you, mentions of a user group you belong to, and follow-ups in
-threads it already delivered. Bots on a skip list, your own messages and its own auto-replies are
-dropped. What survives goes to a resident `claude -p` (haiku, no tools) for triage, and anything
+threads it already delivered. Bots on a skip list and your own messages are dropped; a message you
+sent that mentions yourself is kept unless it carries the agent prefix (`AGENT_MARK` /
+`AGENT_MARK_RE`, same convention as `probe-slack.sh`). What survives goes to a resident `claude -p` (haiku, no tools) for triage, and anything
 worth handling is delivered into a Claude Desktop session through `watch-relay.sh --note-file`.
 The notice carries sender, channel, timestamp, link and the triage reason, never the message text.
 
 All personal settings are environment variables (target session, permission mode, skip lists,
-auto-reply channels and byline, state directory). Slack access goes through
+agent prefix, state directory). Slack access goes through
 [slkcli](https://github.com/therohitdas/slkcli), which reads the Slack desktop app's session on
 macOS; tokens stay inside it. Setup, configuration and limits are in
 [`references/slack-live.md`](references/slack-live.md).
@@ -257,7 +258,7 @@ judgment call.
 ./tests/test-ack.sh             # 21 assertions: watch-ack contract, lock takeover, no lost items when racing the loop
 ./tests/test-slack-modes.sh     # 51 assertions: the three Slack modes, thread-reply pickup, cursor, skipped unchanged threads
 ./tests/test-relay.sh           # 38 assertions: --relay delivery, queue and retry, delivery before exit, id lookup, wake via link, permission mode, --note-file
-./tests/test-slack-live.sh      # 28 assertions: slack-live filtering, triage skip rules, backfill dedup, auto-reply note, retry after restart
+./tests/test-slack-live.sh      # 28 assertions: slack-live filtering, triage skip rules, backfill dedup, agent prefix, retry after restart
 ./tests/test-timeout.sh         #  6 assertions: run_with_timeout without timeout(1) kills the whole process group
 ```
 

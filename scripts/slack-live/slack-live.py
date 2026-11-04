@@ -3,8 +3,9 @@
 
 收:slk-ws.mjs 连 Slack RTM,消息推过来一两秒内收到;连上或重连时,以及每 BACKFILL_SECONDS 秒,
     用 search.messages 补拉断线期间漏掉的。两条路按 ts 共用 seen 去重。
-滤:只留私聊、@我、@我所在的用户组、投递过的 thread 里的后续消息;跳过我自己(@我自己的除外)、
-    自动回复、SKIP_SENDERS 和附件含 SKIP_ATTACHMENT_KEYWORDS 的消息。全在本地,不调模型。
+滤:只留私聊、@我、@我所在的用户组、投递过的 thread 里的后续消息;跳过我自己的消息(@我自己的除外,
+    带 AGENT_MARK / AGENT_MARK_RE 前缀的照样跳过)、SKIP_SENDERS 和附件含 SKIP_ATTACHMENT_KEYWORDS 的消息。
+    全在本地,不调模型。
 判:剩下的交给常驻的 `claude -p`(stream-json,不给任何工具)判断要不要处理,每条判完发 /clear。
     真人私聊、只有文件的消息、@我自己的消息不判,直接投递。
 投:scripts/watch-relay.sh --note-file 投递,和 incremental-watch 的 --relay 共用收件地址解析、
@@ -38,7 +39,6 @@ API_CMD = shlex.split(os.environ.get("SLACK_LIVE_API_CMD", f"node {shlex.quote(o
 WS_CMD = shlex.split(os.environ.get("SLACK_LIVE_WS_CMD", f"node {shlex.quote(os.path.join(HERE, 'slk-ws.mjs'))}"))
 RELAY_CMD = os.environ.get("WATCH_RELAY_CMD", os.path.join(os.path.dirname(HERE), "watch-relay.sh"))
 CLAUDE_CMD = shlex.split(os.environ.get("SLACK_LIVE_CLAUDE", "claude"))
-REPLY_HELPER = os.path.join(HERE, "slk-reply.mjs")
 
 TRIAGE_MODEL = os.environ.get("TRIAGE_MODEL", "haiku")
 BACKFILL_SECONDS = int(os.environ.get("BACKFILL_SECONDS", "300"))
@@ -46,8 +46,9 @@ RELAY_RETRY_SECONDS = int(os.environ.get("RELAY_RETRY_SECONDS", "60"))
 FOLLOW_THREAD_DAYS = int(os.environ.get("FOLLOW_THREAD_DAYS", "7"))
 SKIP_SENDERS = {u.strip().lower() for u in os.environ.get("SKIP_SENDERS", "").split(",") if u.strip()}
 SKIP_ATTACHMENT_KEYWORDS = [k.strip() for k in os.environ.get("SKIP_ATTACHMENT_KEYWORDS", "").split(",") if k.strip()]
-AUTO_REPLY_CHANNELS_FILE = os.path.expanduser(os.environ.get("AUTO_REPLY_CHANNELS_FILE", ""))
-AUTO_REPLY_BYLINE = os.environ.get("AUTO_REPLY_BYLINE", ":robot_face: Auto-reply from agent")
+# 和 templates/probe-slack.sh 同一套约定:agent 用你本人账号发言时带的前缀,带前缀的自己的消息不当成新消息
+AGENT_MARK = os.environ.get("AGENT_MARK", "")
+AGENT_MARK_RE = re.compile(os.environ["AGENT_MARK_RE"]) if os.environ.get("AGENT_MARK_RE") else None
 SEEN_CAP = 500
 GROUPS_REFRESH_SECONDS = 3600
 THREAD_CONTEXT_MESSAGES = 8
@@ -58,17 +59,6 @@ def log(msg):
     print(line, flush=True)
     with open(LOG_FILE, "a") as f:
         f.write(line + "\n")
-
-
-def auto_reply_channels():
-    """每次投递前现读,改名单不用重启。一行一个 channel id,# 后面是注释。没配文件就是不自动回复。"""
-    if not AUTO_REPLY_CHANNELS_FILE:
-        return set()
-    try:
-        with open(AUTO_REPLY_CHANNELS_FILE) as f:
-            return {line.split("#", 1)[0].strip() for line in f} - {""}
-    except FileNotFoundError:
-        return set()
 
 
 def slack(method, **params):
@@ -280,29 +270,13 @@ def follow_thread(msg, state):
 def build_note(msg, reason):
     sender = msg.get("username") or msg.get("user", "")
     channel_id = (msg.get("channel") or {}).get("id", "")
-    note = (
+    return (
         "这是用户本人的 Slack 监听转来的消息,用户要你替他处理:先用 Slack 工具读原文和完整线程,"
-        "再给用户一个结论(要他做什么、回复草稿,或者不用处理并说明原因)。\n"
+        "再给用户一个结论(要他做什么、回复草稿,或者不用处理并说明原因)。不要发 Slack 消息,不要改文件。\n"
         f"【Slack 触发】{describe(msg)} 来自 {sender},channel {channel_id},ts {msg.get('ts', '')}\n"
         f"链接:{msg.get('permalink', '')}\n"
-        f"初判理由:{reason}\n"
+        f"初判理由:{reason}"
     )
-    if (msg.get("_direct") or is_dm(msg)) and channel_id in auto_reply_channels():
-        env = {"AUTO_REPLY_BYLINE": AUTO_REPLY_BYLINE}
-        if os.environ.get("SLKCLI_DIR"):
-            env["SLKCLI_DIR"] = os.environ["SLKCLI_DIR"]
-        prefix = " ".join(f"{k}={shlex.quote(v)}" for k, v in env.items())
-        note += (
-            "这个 channel 已授权自动回复:读完链接所在的完整线程后,用 Bash 执行下面的命令发到原线程,"
-            "把 <正文> 换成回复正文(Markdown,脚本会转成 Slack 格式并加上小字署名,正文里不要再写署名):\n"
-            f"{prefix} node {shlex.quote(REPLY_HELPER)} {channel_id} {thread_ts_of(msg)} <<'SLACK_REPLY_EOF'\n"
-            "<正文>\nSLACK_REPLY_EOF\n"
-            "只发这一条回复,不做其他写操作,不改文件;发完把脚本输出的 permalink 给用户。"
-            "需要用户拍板、需要做写操作或信息不足以回答时不要发,改为起草一版给用户看。"
-        )
-    else:
-        note += "请读这个链接所在的完整线程,判断要用户做什么;需要回复就起草一版。不要发 Slack 消息,不要改文件。"
-    return note
 
 
 def relay(msg, reason):
@@ -364,6 +338,10 @@ def flush_pending(state):
     save_state(state)
 
 
+def is_agent_message(text):
+    return bool((AGENT_MARK and text.startswith(AGENT_MARK)) or (AGENT_MARK_RE and AGENT_MARK_RE.search(text)))
+
+
 def screen(msg, me_id, groups, started_at, threads=None):
     """判断一条消息要不要处理,返回 True 时已标好 _direct / _group / _followup / _self。"""
     ts = msg.get("ts")
@@ -371,8 +349,8 @@ def screen(msg, me_id, groups, started_at, threads=None):
         return False  # 启动之前的历史消息只记账不触发
     text = msg.get("text") or ""
     if msg.get("user") == me_id:
-        # 我自己的消息只收 @我自己 的;自动回复以我的账号发出,text 以署名开头,跳过以免循环
-        if f"<@{me_id}>" not in text or text.startswith(AUTO_REPLY_BYLINE):
+        # 我自己的消息只收 @我自己 的;agent 以我的账号发的消息带前缀,跳过以免循环
+        if f"<@{me_id}>" not in text or is_agent_message(text):
             return False
         msg["_self"] = True
     attachment_text = " ".join(

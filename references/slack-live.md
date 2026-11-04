@@ -15,7 +15,7 @@ search.messages 补拉(连上、重连时各一次,之后每 BACKFILL_SECONDS)�
                                                             ▼
 slack-live.py
   ├─ 本地过滤:私聊 / 正文含 <@我> / 含我所在用户组 / 投递过的 thread 后续
-  │           跳过:我自己的消息(@我自己的除外)、自动回复、SKIP_SENDERS、
+  │           跳过:我自己的消息(@我自己的除外,带 agent 前缀的照样跳过)、SKIP_SENDERS、
   │                 附件含 SKIP_ATTACHMENT_KEYWORDS、改消息删消息事件、启动前的历史消息
   ├─ 初判:常驻 `claude -p --tools ""`(stream-json),每条判完发 /clear
   │        真人私聊、只有文件的消息、我 @ 自己的消息不判,直接投
@@ -46,7 +46,7 @@ slack-live.py
 cd scripts/slack-live && npm install --ignore-scripts   # slkcli@0.2.0 和 ws@8.22.1,版本钉死
 ```
 
-已经有一份 slkcli 本地 checkout 的,可以设 `SLKCLI_DIR=<checkout 路径>`,三个 `slk-*.mjs` 改从那里加载。
+已经有一份 slkcli 本地 checkout 的,可以设 `SLKCLI_DIR=<checkout 路径>`,`slk-api.mjs` 和 `slk-ws.mjs` 改从那里加载。
 
 ## 配置
 
@@ -65,16 +65,8 @@ cd scripts/slack-live && npm install --ignore-scripts   # slkcli@0.2.0 和 ws@8.
 | `SKIP_SENDERS` | 空 | 逗号分隔的发送人 username(不区分大小写),直接跳过。CI、审批机器人放这里 |
 | `SKIP_ATTACHMENT_KEYWORDS` | 空 | 逗号分隔的关键词,附件的 pretext、text、fallback、author_name 含任一个就跳过 |
 | `SLACK_QUERY` | `@<你的 handle>` | 补拉 @我 用的搜索语句;私聊固定另搜 `to:me` |
-| `AUTO_REPLY_CHANNELS_FILE` | 空(不自动回复) | 自动回复名单文件,一行一个 channel id(私聊用 `D` 开头的那种 id 也行),`#` 后面是注释,每次投递前现读 |
-| `AUTO_REPLY_BYLINE` | `:robot_face: Auto-reply from agent` | 自动回复的署名,也是监听认出自动回复、跳过它的依据 |
+| `AGENT_MARK` / `AGENT_MARK_RE` | 空 | agent 用你本人账号发言时带的前缀(字面 startswith / 正则),和 `templates/probe-slack.sh` 同一套约定。你自己发的、@了自己的消息会被收下投递,带这个前缀的除外,免得 agent 代你发的消息又把自己叫醒 |
 | `SLKCLI_DIR` | 空 | 用本地 slkcli checkout 代替 npm 包 |
-
-## 自动回复
-
-名单里的 channel 里直接 @我(正文含 `<@我>`,@组不算),或者名单里的私聊,投递说明会授权目标会话读完线程后
-用 `slk-reply.mjs` 以你本人的账号回到原线程:署名放在 context block 里显示成小号灰字,正文按 Markdown 转成
-`rich_text`。需要你拍板、要做写操作或信息不足时,会话只起草不发。监听靠 `AUTO_REPLY_BYLINE` 认出这些回复,
-所以署名改了两边会一起变(说明里的命令带着同一个署名)。
 
 ## 运行
 
