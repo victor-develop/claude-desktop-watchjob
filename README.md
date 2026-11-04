@@ -7,17 +7,16 @@ the agent only when a cursor diff says something actually changed.
 a detached shell loop                     ← sleeping is free
   ├─ run a probe, diff against a cursor   ← all judgment happens in shell
   ├─ nothing new  → sleep, keep going
-  └─ something new → write inbox.json → message the session directly   ← delivery IS the wake-up
+  └─ something new → write inbox.json, touch wake → the waiter exits   ← exiting IS the wake-up
 ```
 
-Recommended: start the loop with `--relay` under `nohup`. When something changes it delivers a
-short notice straight into a named Claude Desktop session through `claude -p` with only the
-`SendMessage` tool enabled, then keeps polling. No helper has to sit in the session's background
-tasks, so there is no 2-hour re-arm and no exit-code bookkeeping. The decision *"is this worth
-interrupting the model for?"* still runs in shell, for free.
+Default: run the loop under `nohup` with `--daemon`, and keep `watch-wait.sh` in the session with
+the Bash tool's `run_in_background: true`. The waiter only reads local files; when it exits the
+harness wakes the agent and hands it the exit code. The decision *"is this worth interrupting the
+model for?"* runs in shell, for free.
 
-The original exit-code mode is still there: launch the loop (or `watch-wait.sh`) with the Bash
-tool's `run_in_background: true`, and the harness wakes the agent when it exits.
+There is also an optional direct-delivery mode (`--relay`) that messages the session instead. It
+has a known limitation and is not the default; see [Direct delivery](#direct-delivery---relay).
 
 Works for anything you can diff with a cursor: PR comments and reviews, CI status, Slack thread
 replies, HTTP JSON endpoints, directory changes.
@@ -57,6 +56,18 @@ cp -r claude-desktop-watchjob ~/.claude/skills/incremental-watch
 probe uses.
 
 ## Direct delivery (`--relay`)
+
+Optional, not the default. **Known limitation: a notice is silently held when permission modes
+differ.** The delivery runs as `claude -p --permission-mode auto`. If the target session runs in a
+different permission mode (for example bypass), Claude Desktop does not hand the message to the
+session; it holds it in the session waiting for someone to approve it ("held — waiting for
+approval", "the sender's permission mode differs"). `SendMessage` still reports success to the
+sender, so the loop logs the notice as delivered and never retries it. With nobody at the screen
+the notice just sits there. Tested 2026-11-04: with the session in bypass, every notice from an
+`auto` sender was held; with the sender switched to bypass, an idle session was woken in about 10
+seconds. The session registry has no permission-mode field, so the script cannot match it
+automatically, and the mode is currently fixed in `watch-relay.sh`. Use `--relay` only when you
+know the target session runs in `auto` and will stay there; otherwise use the waiter.
 
 ```bash
 export REPO=owner/repo PR=123 SELF=your-github-login

@@ -111,6 +111,7 @@ homebrew 装的东西全都找不到。
 | 会话名有限制 | (同上)名字含括号或 `@` 时 SendMessage 解析失败 |
 | 不认 local_ id | `claude -p` 里 SendMessage 的 to 填 `local_<id>` 返回「没有可达的 agent」;它的 ListAgents 只列会话标题和一个短 ref |
 | 认 uds 地址 | `~/.claude/sessions/<pid>.json` 里有 `hostSessionId`(即 local_ id)、当前标题和 `messagingSocketPath`;to 填 `uds:<messagingSocketPath>` 投递成功(claude-code 2.1.309 写的登记文件) |
+| 权限模式要一致 | (2026-11-04 实测,目标会话开着 bypass)`--permission-mode auto` 的发送方投过来的消息被 Desktop 挂起,会话里显示 `held — waiting for approval`、`the sender's permission mode differs`,要人点批准才进会话;SendMessage 对发送方仍返回成功,循环记成已投递、不重投。发送方换成 `bypassPermissions` 后直接送达,会话空闲时约 10 秒被叫醒。`~/.claude/sessions/*.json` 里没有权限模式字段,没法自动对齐 |
 | 不依赖 harness 后台任务 | 投递方是任意本机进程,所以循环可以 nohup 长跑,不用叫醒器、不用 2 小时重挂 |
 
 这条通道的代价是每次投递一次小模型调用;正文由脚本拼好,模型只负责调工具,不读 inbox 内容。
