@@ -101,9 +101,12 @@ cache-read。
 
 ## 两个必踩的坑
 
-**滤掉自己和 bot。** 否则你自己的回复把自己叫醒,无限循环。GitHub 侧默认滤
-`\[bot\]$|^web-flow$`,可以用 `BOT_RE` 加;Slack 侧滤 `bot_id != null` 和 join/leave
-这类 `subtype`。
+**滤掉自己和 bot。** 否则你自己的回复把自己叫醒,无限循环。「自己」只按 agent 前缀认,
+不按账号:`SELF` 名下以 `AGENT_PREFIX`(默认 `[ 🐶 Claude:]`,`:dog:` 写法也认)开头的滤掉,
+不带前缀的当成本人手打的留着 —— agent 和你共用账号时,按账号整个滤掉会把你本人的回复一起吃掉。
+自己写 probe 时 source `_lib.sh`,用里面的 `agent_prefixes_json` 和 `AGENT_JQ_DEF`,别再写
+`.user != $self` 这种只看账号的判断。bot 照旧:GitHub 侧默认滤 `\[bot\]$|^web-flow$`,可以用
+`BOT_RE` 加;Slack 侧滤 `bot_id != null` 和 join/leave 这类 `subtype`。
 
 **所有网络调用都要设超时。** 循环挂掉是安全的 —— 它退出,agent 就被叫醒。但循环**挂死**
 永远不退出,也就永远不叫醒任何人。这是这套机制里唯一不告警的失效方式。

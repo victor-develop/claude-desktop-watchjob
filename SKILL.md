@@ -77,8 +77,7 @@ probe 是一个可执行脚本,唯一职责:**把当前状态压成一个 JSON �
   `thread_ts` 告诉你回在哪个 thread 里,顶层为 null),**换模式不用重新 seed**
 - 旧入口 `probe-slack-thread.sh`(= `thread`)和 `probe-slack-channel.sh`(= `all-threads`,
   `EXCLUDE_REPLIES=1` 时 = `top-level`)还能用,已经在跑的 watch 不用改
-- agent 用你本人账号发言时,配 `AGENT_MARK` / `AGENT_MARK_RE`(或 `SELF_KEEP_HUMAN=1`,等于按
-  `[ 🐶 Claude:]` 前缀),只滤带前缀的自己,你本人手打的照样叫醒 agent。三种模式同一套规则
+- 「自己」只按 agent 前缀认,见下面「过滤自己」。三种模式同一套规则
 
 配置全走环境变量,直接把模板当 `--probe` 用,不用改文件。变量从启动 `watch-loop.sh` 的
 shell 继承,所以要在同一条命令里 export。每个模板顶部注释是完整用法。
@@ -87,6 +86,14 @@ shell 继承,所以要在同一条命令里 export。每个模板顶部注释是
 
 probe 里要把**自己和 bot 过滤掉**,否则你自己的回复会把自己叫醒,形成死循环。这是这类
 watch 最常见的翻车方式。
+
+**过滤自己:只按前缀,不按账号。** agent 通常用你本人的 Slack / GitHub 账号发言,账号分不出
+是谁在说话。所以所有模板只滤 `SELF` 名下**以 agent 前缀开头**的消息(`AGENT_PREFIX`,默认
+`[ 🐶 Claude:]`,Slack 存成 `[ :dog: Claude:]` 也认);`SELF` 名下不带前缀的当成你本人手打的,
+照样叫醒 agent;别人的一律不滤。不再有「`SELF` 发的全滤掉」这条路 —— 它会把你本人在 thread /
+PR 里的回复一起吃掉,还不留任何痕迹。代价是 agent 发言**必须带前缀**,忘了带就会把自己叫醒一次。
+旧配置里的 `SELF_KEEP_HUMAN` 直接忽略,`AGENT_MARK` 是 `AGENT_PREFIX` 的旧名。规则写在
+`scripts/templates/_lib.sh` 末尾,自己写 probe 也用它。
 
 ### 2. 对齐游标(别漏这步)
 

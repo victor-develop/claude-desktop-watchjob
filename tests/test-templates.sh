@@ -44,16 +44,23 @@ payload() {
       cat <<'JSON'
 [
  {"id":1,"user":{"login":"alice"},"updated_at":"2026-01-01T10:00:00Z","body":"看一下"},
- {"id":9,"user":{"login":"me"},"updated_at":"2026-01-01T09:00:00Z","body":"我自己发的"},
+ {"id":9,"user":{"login":"me"},"updated_at":"2026-01-01T09:00:00Z","body":"[ 🐶 Claude:] agent 用我的号发的"},
  {"id":8,"user":{"login":"ci-thing[bot]"},"updated_at":"2026-01-01T09:30:00Z","body":"bot 噪音"},
  {"id":7,"user":null,"updated_at":"2026-01-01T09:40:00Z","body":"删号用户留下的"}
-]
 JSON
+      # STUB_GH_HUMAN=1:再加「本人用同一个号手打的」和「别人引用 agent 的话」两条
+      [ -n "\${STUB_GH_HUMAN:-}" ] && cat <<'JSON'
+ ,{"id":10,"user":{"login":"me"},"updated_at":"2026-01-01T10:10:00Z","body":"本人手打：这里再改改"}
+ ,{"id":11,"user":{"login":"alice"},"updated_at":"2026-01-01T10:20:00Z","body":"[ 🐶 Claude:] 别人引用了 agent 的话"}
+JSON
+      echo ']'
       ;;
     *pulls/*/comments*)
       echo '[{"id":1,"user":{"login":"bob"},"updated_at":"2026-01-01T09:50:00Z","path":"a.go","body":"这行"}]' ;;
     *pulls/*/reviews*)
-      echo '[{"id":1,"user":{"login":"bob"},"submitted_at":"2026-01-01T11:00:00Z","state":"APPROVED","body":null}]' ;;
+      # 回 inline 评论时 GitHub 会顺带建一条没正文的 review,自己名下的这种没东西可读
+      echo '[{"id":1,"user":{"login":"bob"},"submitted_at":"2026-01-01T11:00:00Z","state":"APPROVED","body":null},
+             {"id":2,"user":{"login":"me"},"submitted_at":"2026-01-01T11:05:00Z","state":"COMMENTED","body":""}]' ;;
     *) echo '[]' ;;
   esac
 }
@@ -108,7 +115,8 @@ case "$1" in
  {"ts":"1767261700.000100","user":"U_ME","text":"[ AGENT ] agent 用我的号发的"},
  {"ts":"1767261750.000100","user":"U_ME","text":"[ :dog: AGENT ] emoji 被转成 shortcode 的那条"},
  {"ts":"1767261800.000100","user":"U_ME","text":"本人手打：去把它改了"},
- {"ts":"1767261900.000100","user":"U_ALICE","text":"[ AGENT ] 别人引用了 agent 的话再追问"}
+ {"ts":"1767261900.000100","user":"U_ALICE","text":"[ AGENT ] 别人引用了 agent 的话再追问"},
+ {"ts":"1767261950.000100","user":"U_ME","text":"[ :dog: Claude:] 默认前缀的 agent 发言"}
 ],"users":[{"id":"U_ALICE","name":"alice","real_name":"Alice Example"},
            {"id":"U_ME","name":"me","real_name":"Me"}]}
 JSON
@@ -117,7 +125,7 @@ JSON
     cat <<'JSON'
 {"channel_id":"C_X","message_count":4,"messages":[
  {"ts":"1767261600.000100","user":"U_ALICE","text":"thread 里问一句"},
- {"ts":"1767261000.000100","user":"U_ME","text":"我自己发的"},
+ {"ts":"1767261000.000100","user":"U_ME","text":"[ :dog: Claude:] agent 发的,emoji 存成了 shortcode"},
  {"ts":"1767261300.000100","user":"U_BOT","bot_id":"B1","text":"bot 噪音"},
  {"ts":"1767261400.000100","user":"U_ALICE","subtype":"channel_join","text":"joined"}
 ],"users":[{"id":"U_ALICE","name":"alice","real_name":"Alice Example"},
@@ -128,7 +136,7 @@ JSON
     cat <<'JSON'
 {"messages":[
  {"ts":"1767261600.000100","user":"U_ALICE","user_name":"alice","text":"thread 里问一句"},
- {"ts":"1767261000.000100","user":"U_ME","user_name":"me","text":"我自己发的"},
+ {"ts":"1767261000.000100","user":"U_ME","user_name":"me","text":"[ 🐶 Claude:] agent 发的"},
  {"ts":"1767261300.000100","user":"U_BOT","bot_id":"B1","text":"bot 噪音"},
  {"ts":"1767261400.000100","user":"U_ALICE","subtype":"channel_join","text":"joined"}
 ]}
@@ -175,6 +183,16 @@ eq "按 at 升序"        "$(echo "$OUT" | jq -c '[.[].id]')" '["ic7","rc1","ic1
 eq "没有自己"          "$(echo "$OUT" | jq '[.[] | select(.who == "me")] | length')" "0"
 eq "没有 bot"          "$(echo "$OUT" | jq '[.[] | select(.who | test("\\[bot\\]$"))] | length')" "0"
 eq "三种 kind 都在"    "$(echo "$OUT" | jq -c '[.[].kind] | sort | unique')" '["pr-comment","pr-inline","pr-review"]'
+
+# agent 和本人共用 GitHub 账号:只滤带前缀的,本人手打的必须叫醒
+echo "== probe-github-pr：只按前缀认自己,本人手打的留下 =="
+OUT=$(STUB_GH_HUMAN=1 "$T_DIR/probe-github-pr.sh")
+eq "本人手打的留下"            "$(echo "$OUT" | jq -c '[.[] | select(.who == "me") | .id]')" '["ic10"]'
+eq "别人引用带前缀的话不被误滤" "$(echo "$OUT" | jq '[.[] | select(.id == "ic11")] | length')" "1"
+eq "旧的 SELF_KEEP_HUMAN=0 不会退回按账号全滤" \
+  "$(STUB_GH_HUMAN=1 SELF_KEEP_HUMAN=0 "$T_DIR/probe-github-pr.sh" | jq -c '[.[] | select(.who == "me") | .id]')" '["ic10"]'
+eq "AGENT_PREFIX 可换" \
+  "$(STUB_GH_HUMAN=1 AGENT_PREFIX='本人手打' "$T_DIR/probe-github-pr.sh" | jq -c '[.[] | select(.who == "me") | .id]')" '["ic9"]'
 
 echo "== probe-github-pr：PR 关掉 → terminal =="
 echo merged > "$MODE"
@@ -235,10 +253,14 @@ eq "本人手打的留下来" \
 # 别人引用 agent 的话也算进来,那正是上面那条用例要防的。
 eq "agent 自己发的滤掉" \
   "$(echo "$OUT_MARK" | jq -r '[.[] | select(.body | test("agent 用我的号发的"))] | length')" "0"
-# 没配 AGENT_MARK 时保持原行为：按 user id 滤,本人的两条都不出现
+# 什么都不配:用默认前缀 [ 🐶 Claude:](:dog: 写法也认)。没有「按 user id 全滤」这条路
 OUT_NOMARK=$(STUB_SLACK_AGENT=1 "$T_DIR/probe-slack-thread.sh")
-eq "不配则仍按 user id 滤" \
-  "$(echo "$OUT_NOMARK" | jq -r '[.[] | select(.who == "Me")] | length')" "0"
+eq "不配:默认前缀的 agent 发言滤掉" \
+  "$(echo "$OUT_NOMARK" | jq -r '[.[] | select(.body | test("默认前缀的"))] | length')" "0"
+eq "不配:本人不带前缀的都留下" \
+  "$(echo "$OUT_NOMARK" | jq -c '[.[] | select(.who == "Me") | .id]')" '["1767261000.000100","1767261700.000100","1767261750.000100","1767261800.000100"]'
+eq "旧的 SELF_KEEP_HUMAN=0 不会退回按账号全滤" \
+  "$(STUB_SLACK_AGENT=1 SELF_KEEP_HUMAN=0 "$T_DIR/probe-slack-thread.sh")" "$OUT_NOMARK"
 # marker 不能单独作数:别人引用 agent 的话时正文开头也带 marker,只按 marker 认就把
 # 别人的追问一起吃掉了 —— 必须 user id 和 marker 同时命中才算「自己发的」。
 eq "别人引用带 marker 的话不会被误滤" \
@@ -249,8 +271,12 @@ echo "== probe-slack-thread：AGENT_MARK_RE 兼容 emoji / shortcode 两种形�
 OUT_RE=$(STUB_SLACK_AGENT=1 AGENT_MARK_RE='^\[ (:dog:|🐶) AGENT \]' "$T_DIR/probe-slack-thread.sh")
 eq "shortcode 形态也认得出是自己发的" \
   "$(echo "$OUT_RE" | jq -r '[.[] | select(.body | test("shortcode 的那条"))] | length')" "0"
-eq "字面前缀对 shortcode 无效(所以要有 _RE)" \
-  "$(STUB_SLACK_AGENT=1 AGENT_MARK='[ 🐶 AGENT ]' "$T_DIR/probe-slack-thread.sh" | jq -r '[.[] | select(.body | test("shortcode 的那条"))] | length')" "1"
+eq "前缀里的 🐶 也认 :dog: 写法" \
+  "$(STUB_SLACK_AGENT=1 AGENT_MARK='[ 🐶 AGENT ]' "$T_DIR/probe-slack-thread.sh" | jq -r '[.[] | select(.body | test("shortcode 的那条"))] | length')" "0"
+
+echo "== probe-slack-thread-prefix：同一套规则(只滤 SELF 名下带前缀的) =="
+OUT_P=$(STUB_SLACK_AGENT=1 "$T_DIR/probe-slack-thread-prefix.sh")
+eq "和 probe-slack-thread 留下的一样" "$(echo "$OUT_P" | jq -c '[.[].id]')" "$(echo "$OUT_NOMARK" | jq -c '[.[].id]')"
 
 echo "== TERMINATE_RE 命中 → 标成 terminal =="
 eq "命中" "$(TERMINATE_RE='问一句' "$T_DIR/probe-slack-thread.sh" | jq -r '.[0].kind')" "terminal"
