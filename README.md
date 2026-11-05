@@ -206,7 +206,11 @@ Probe recipes for common sources are in [`references/sources.md`](references/sou
 ## Two things that are easy to get wrong
 
 **Filter out yourself and bots in the probe.** Otherwise your own reply wakes you up, and you
-loop forever.
+loop forever. "Yourself" means *the agent*, recognised by its prefix, not by account: agents
+usually post with your own Slack / GitHub account, so filtering the whole `SELF` account would
+also swallow everything you type yourself. The templates drop only `SELF` messages that start
+with `AGENT_PREFIX` (default `[ 🐶 Claude:]`; Slack's `:dog:` shortcode form matches too) and
+keep the rest. The rule lives at the end of `scripts/templates/_lib.sh`.
 
 **Always set a timeout on network calls in the probe.** A crashed loop is safe — it exits, which
 wakes the agent. A *hung* loop never exits and therefore never wakes anyone. That's the only

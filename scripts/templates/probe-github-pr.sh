@@ -11,7 +11,10 @@
 # 配置(环境变量):
 #   REPO      必需  owner/repo
 #   PR        必需  PR 号
-#   SELF      必需  你自己的 GitHub login。不填会被自己的回复叫醒,死循环
+#   SELF      必需  你自己的 GitHub login。只滤 SELF 名下带 agent 前缀的评论(默认
+#             '[ 🐶 Claude:]',见 _lib.sh 末尾的 AGENT_PREFIX),本人手打的照样叫醒;
+#             外加 SELF 名下没正文的 review —— 回 inline 评论时 GitHub 会顺带建一条空 review,
+#             没东西可读
 #             也可以用 GITHUB_SELF —— 跟 Slack 模板同时用时,两边的 SELF 会互相覆盖,
 #             那种场合请显式用 GITHUB_SELF / SLACK_SELF
 #   BOT_RE    可选  额外要过滤的账号正则,默认 '\[bot\]$|^web-flow$'
@@ -31,6 +34,7 @@ set -uo pipefail
 require_bin gh jq
 SELF="${GITHUB_SELF:-${SELF:-}}"
 require_env REPO PR SELF
+PREFIXES=$(agent_prefixes_json) || { echo "AGENT_PREFIX 解析失败" >&2; exit 3; }
 
 BOT_RE="${BOT_RE:-$default_bot_re}"
 TIMEOUT="${TIMEOUT:-60}"
@@ -83,8 +87,8 @@ C_REVIEW=$(fetch "review 状态" api --paginate "repos/$REPO/pulls/$PR/reviews" 
          kind:\"pr-review\", state:.state, body:((.body // \"\")[0:$BODY_MAX])}") || exit 3
 
 printf '%s\n%s\n%s\n' "$C_ISSUE" "$C_INLINE" "$C_REVIEW" \
-  | jq -sc --arg self "$SELF" --arg bots "$BOT_RE" \
-      '[ .[]
-         | select(.who != $self)
+  | jq -sc --arg self "$SELF" --arg bots "$BOT_RE" --argjson prefixes "$PREFIXES" --arg markre "${AGENT_MARK_RE:-}" \
+      "$AGENT_JQ_DEF"'[ .[]
+         | select(.who != $self or ((.body // "") | length > 0 and (is_agent($prefixes; $markre) | not)))
          | select(.who | test($bots) | not)
        ] | sort_by(.at)'

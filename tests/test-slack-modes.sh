@@ -113,7 +113,7 @@ ids() { jq -c '[.[].id | split(".")[0] | .[7:10]]'; }   # 1000000150.000100 → 
 
 export CHANNEL=D0TEST SELF=U_ME SLACKCLI_ALLOW_UNTESTED=0 RETRY_TIMES=1 RETRY_SLEEP=0 TIMEOUT=10
 export THREAD_CACHE_DIR="$T/cache"
-unset SLACK_MODE THREAD_TS EXCLUDE_REPLIES SELF_KEEP_HUMAN AGENT_MARK AGENT_MARK_RE SLACK_SELF
+unset SLACK_MODE THREAD_TS EXCLUDE_REPLIES SELF_KEEP_HUMAN AGENT_PREFIX AGENT_MARK AGENT_MARK_RE SLACK_SELF
 
 echo "== 参数校验 =="
 SLACK_MODE=bogus "$PROBE" >/dev/null 2>&1; eq "SLACK_MODE 非法 → exit 3" "$?" "3"
@@ -122,9 +122,9 @@ THREAD_SCAN=abc "$PROBE" >/dev/null 2>&1; eq "THREAD_SCAN 非数字 → exit 3" 
 SLACK_MODE=thread "$PROBE" >/dev/null 2>&1; eq "thread 模式缺 THREAD_TS → exit 2" "$?" "2"
 
 echo "== all-threads:thread 回复能抓到,过滤规则对 =="
-OUT=$(PROBE_CURSOR=1000000140.000000 SELF_KEEP_HUMAN=1 SLACK_MODE=all-threads "$PROBE"); rc=$?
+OUT=$(PROBE_CURSOR=1000000140.000000 SLACK_MODE=all-threads "$PROBE"); rc=$?
 eq "exit 0" "$rc" "0"
-eq "顶层 + 两个 thread 的回复,自己带前缀的 / bot 被滤" "$(echo "$OUT" | ids)" '["150","200","260","300","350"]'
+eq "顶层 + 两个 thread 的回复,自己带前缀的 / bot 被滤(默认前缀,不用配)" "$(echo "$OUT" | ids)" '["150","200","260","300","350"]'
 eq "回复:kind=slack-reply,thread_ts=父消息" \
    "$(echo "$OUT" | jq -c '.[] | select(.id=="1000000150.000100") | [.kind, .thread_ts, .who]')" \
    "[\"slack-reply\",\"$P1\",\"Alice Example\"]"
@@ -132,46 +132,48 @@ eq "顶层:kind=slack-message,thread_ts=null" \
    "$(echo "$OUT" | jq -c '.[] | select(.id=="1000000200.000100") | [.kind, .thread_ts]')" '["slack-message",null]'
 eq "每项字段一致" "$(echo "$OUT" | jq -c '[.[] | keys] | unique')" '[["at","body","id","kind","thread_ts","who"]]'
 
-OUT=$(PROBE_CURSOR=1000000140.000000 SLACK_MODE=all-threads THREAD_CACHE_DIR="$T/c-nokeep" "$PROBE")
-eq "不开 SELF_KEEP_HUMAN:本人的消息全滤" "$(echo "$OUT" | ids)" '["150","200","350"]'
+OUT=$(PROBE_CURSOR=1000000140.000000 SLACK_MODE=all-threads THREAD_CACHE_DIR="$T/c-keep" SELF_KEEP_HUMAN=1 "$PROBE")
+eq "旧的 直接忽略,结果不变" "$(echo "$OUT" | ids)" '["150","200","260","300","350"]'
+OUT=$(PROBE_CURSOR=1000000140.000000 SLACK_MODE=all-threads THREAD_CACHE_DIR="$T/c-nokeep" SELF_KEEP_HUMAN=0 "$PROBE")
+eq "SELF_KEEP_HUMAN=0 也不会退回「按账号全滤」" "$(echo "$OUT" | ids)" '["150","200","260","300","350"]'
 OUT=$(PROBE_CURSOR=1000000140.000000 SLACK_MODE=all-threads THREAD_CACHE_DIR="$T/c-mark" AGENT_MARK_RE='^\[ (:dog:|🐶) Claude:\]' "$PROBE")
 eq "AGENT_MARK_RE 在 all-threads 下也生效" "$(echo "$OUT" | ids)" '["150","200","260","300","350"]'
 
 echo "== top-level:不碰 thread =="
 : > "$CALLS"
 OUT=$(PROBE_CURSOR=1000000140.000000 SLACK_MODE=top-level "$PROBE")
-eq "只有顶层" "$(echo "$OUT" | ids)" '["200"]'
+eq "只有顶层(本人手打的 P3 也在)" "$(echo "$OUT" | ids)" '["200","300"]'
 eq "没有任何 --thread-ts 调用" "$(thread_calls)" "0"
 eq "每轮只打 1 次接口" "$(wc -l < "$CALLS" | tr -d ' ')" "1"
 OUT=$(PROBE_CURSOR=1000000140.000000 EXCLUDE_REPLIES=1 "$PROBE")
-eq "EXCLUDE_REPLIES=1 等于 top-level" "$(echo "$OUT" | ids)" '["200"]'
+eq "EXCLUDE_REPLIES=1 等于 top-level" "$(echo "$OUT" | ids)" '["200","300"]'
 
 echo "== thread:只看指定那条 =="
-OUT=$(PROBE_CURSOR=1000000140.000000 THREAD_TS=$P1 SELF_KEEP_HUMAN=1 "$PROBE")
+OUT=$(PROBE_CURSOR=1000000140.000000 THREAD_TS=$P1 "$PROBE")
 eq "给了 THREAD_TS 默认就是 thread 模式" "$(echo "$OUT" | ids)" '["150","260"]'
 eq "thread 模式形状一致" "$(echo "$OUT" | jq -c '[.[] | [.kind, .thread_ts]] | unique')" "[[\"slack-reply\",\"$P1\"]]"
-OUT2=$(PROBE_CURSOR=1000000140.000000 THREAD_TS=$P1 SELF_KEEP_HUMAN=1 SLACK_MODE=all-threads "$T_DIR/probe-slack-thread.sh")
+OUT2=$(PROBE_CURSOR=1000000140.000000 THREAD_TS=$P1 SLACK_MODE=all-threads "$T_DIR/probe-slack-thread.sh")
 eq "旧入口 probe-slack-thread.sh 输出相同(且无视外面的 SLACK_MODE)" "$OUT2" "$OUT"
-OUT=$(THREAD_TS=$P1 LIMIT=2 SELF_KEEP_HUMAN=1 "$PROBE")
+OUT=$(THREAD_TS=$P1 LIMIT=2 "$PROBE")
 eq "没游标 + LIMIT=2:翻页取全(父消息 kind=slack-message)" \
    "$(echo "$OUT" | jq -c '[.[] | [(.id|.[7:10]), .kind]]')" \
    '[["100","slack-message"],["150","slack-reply"],["260","slack-reply"]]'
 
 echo "== 旧入口 probe-slack-channel.sh:默认 all-threads,THREAD_TS 不会把它变成 thread 模式 =="
-OUT=$(PROBE_CURSOR=1000000140.000000 THREAD_TS=$P3 SELF_KEEP_HUMAN=1 THREAD_CACHE_DIR="$T/c-wrap" "$T_DIR/probe-slack-channel.sh")
+OUT=$(PROBE_CURSOR=1000000140.000000 THREAD_TS=$P3 THREAD_CACHE_DIR="$T/c-wrap" "$T_DIR/probe-slack-channel.sh")
 eq "能看到 thread 回复" "$(echo "$OUT" | ids)" '["150","200","260","300","350"]'
 OUT=$(PROBE_CURSOR=1000000140.000000 EXCLUDE_REPLIES=1 "$T_DIR/probe-slack-channel.sh")
-eq "EXCLUDE_REPLIES=1 仍是只看顶层" "$(echo "$OUT" | ids)" '["200"]'
+eq "EXCLUDE_REPLIES=1 仍是只看顶层" "$(echo "$OUT" | ids)" '["200","300"]'
 
 echo "== 经 watch-loop:游标推进 + 没变化的 thread 不重拉 =="
 rm -rf "$T/cache"; ST="$T/st"
-run() { SELF_KEEP_HUMAN=1 "$LOOP" --name m --probe "$T_DIR/probe-slack-channel.sh" --state-dir "$ST" "$@" >/dev/null 2>&1; echo $?; }
+run() { "$LOOP" --name m --probe "$T_DIR/probe-slack-channel.sh" --state-dir "$ST" "$@" >/dev/null 2>&1; echo $?; }
 eq "seed" "$(run --seed)" "0"
 eq "seed 后游标 = 所有可见消息里最新的(含 thread 回复)" "$(cat "$ST/cursor")" "1000000350.000100"
 : > "$CALLS"
 eq "没新消息 → 跑满 13" "$(run --interval 1 --max-runtime 3)" "13"
 : > "$CALLS"
-OUT=$(SELF_KEEP_HUMAN=1 PROBE_CURSOR=$(cat "$ST/cursor") "$T_DIR/probe-slack-channel.sh")
+OUT=$(PROBE_CURSOR=$(cat "$ST/cursor") "$T_DIR/probe-slack-channel.sh")
 eq "缓存热了之后:没有新东西" "$OUT" "[]"
 eq "稳态没有 thread 被重拉,每轮只有 2 次请求" "$(thread_calls) $(wc -l < "$CALLS" | tr -d ' ')" "0 2"
 
@@ -182,16 +184,16 @@ eq "inbox 拿到这条回复" "$(jq -c '[.[] | [(.id|.[7:10]), .kind, .thread_ts
 eq "游标推进到这条回复" "$(cat "$ST/cursor")" "1000000400.000100"
 eq "只拉了有变化的那条 thread" "$(grep -- '--thread-ts' "$CALLS" | grep -c -- "$P3")" "0"
 : > "$CALLS"
-: > "$CALLS"; SELF_KEEP_HUMAN=1 PROBE_CURSOR=$(cat "$ST/cursor") "$T_DIR/probe-slack-channel.sh" >/dev/null
+: > "$CALLS"; PROBE_CURSOR=$(cat "$ST/cursor") "$T_DIR/probe-slack-channel.sh" >/dev/null
 eq "回复数刚变的 thread 下一轮再确认一次" "$(grep -- '--thread-ts' "$CALLS" | grep -c -- "$P1")" "1"
-: > "$CALLS"; SELF_KEEP_HUMAN=1 PROBE_CURSOR=$(cat "$ST/cursor") "$T_DIR/probe-slack-channel.sh" >/dev/null
+: > "$CALLS"; PROBE_CURSOR=$(cat "$ST/cursor") "$T_DIR/probe-slack-channel.sh" >/dev/null
 eq "确认过之后不再重拉" "$(thread_calls)" "0"
 
 echo "== 最后一条回复是自己发的:照样能跳过,不会每轮重拉 =="
 add_reply $P1 1000000410.000100 U_ME "[ 🐶 Claude:] agent 回了一句"
-for i in 1 2; do SELF_KEEP_HUMAN=1 PROBE_CURSOR=$(cat "$ST/cursor") "$T_DIR/probe-slack-channel.sh" >/dev/null; done
+for i in 1 2; do PROBE_CURSOR=$(cat "$ST/cursor") "$T_DIR/probe-slack-channel.sh" >/dev/null; done
 : > "$CALLS"
-OUT=$(SELF_KEEP_HUMAN=1 PROBE_CURSOR=$(cat "$ST/cursor") "$T_DIR/probe-slack-channel.sh")
+OUT=$(PROBE_CURSOR=$(cat "$ST/cursor") "$T_DIR/probe-slack-channel.sh")
 eq "自己的回复不叫醒" "$OUT" "[]"
 eq "第三轮起不再拉这个 thread" "$(thread_calls)" "0"
 
@@ -204,9 +206,9 @@ eq "游标没动,再跑一次还拿得到 R7" "$(echo "$OUT" | ids)" '["450"]'
 
 echo "== 换模式不用重新 seed:top-level → all-threads =="
 ST2="$T/st2"; rm -rf "$T/cache"
-eq "top-level seed" "$(SLACK_MODE=top-level SELF_KEEP_HUMAN=1 "$LOOP" --name m2 --probe "$PROBE" --state-dir "$ST2" --seed >/dev/null 2>&1; echo $?)" "0"
+eq "top-level seed" "$(SLACK_MODE=top-level "$LOOP" --name m2 --probe "$PROBE" --state-dir "$ST2" --seed >/dev/null 2>&1; echo $?)" "0"
 eq "游标 = 最新顶层" "$(cat "$ST2/cursor")" "$P3"
-rc=$(SLACK_MODE=all-threads SELF_KEEP_HUMAN=1 "$LOOP" --name m2 --probe "$PROBE" --state-dir "$ST2" --interval 1 --max-runtime 20 >/dev/null 2>&1; echo $?)
+rc=$(SLACK_MODE=all-threads "$LOOP" --name m2 --probe "$PROBE" --state-dir "$ST2" --interval 1 --max-runtime 20 >/dev/null 2>&1; echo $?)
 eq "切到 all-threads → 10" "$rc" "10"
 eq "补上游标之后发在 thread 里的回复,顶层不重复" "$(jq -c '[.[].id | .[7:10]]' "$ST2/inbox.json")" '["350","400","450"]'
 
@@ -222,18 +224,18 @@ eq "只拉了 P3" "$(grep -- '--thread-ts' "$CALLS" | sed 's/.*--thread-ts \([^ 
 
 echo "== 一轮里先后读多个源:后读到的新回复不会把先读时还没出现的顶层消息越过去 =="
 rm -rf "$T/cache"; ST3="$T/st3"
-run3() { SLACK_MODE=all-threads SELF_KEEP_HUMAN=1 "$LOOP" --name m3 --probe "$PROBE" --state-dir "$ST3" "$@" >/dev/null 2>&1; echo $?; }
+run3() { SLACK_MODE=all-threads "$LOOP" --name m3 --probe "$PROBE" --state-dir "$ST3" "$@" >/dev/null 2>&1; echo $?; }
 eq "seed" "$(run3 --seed)" "0"
 rm -rf "$T/cache"   # 让下一轮一定去拉 thread,竞态才会出现
-OUT=$(STUB_RACE_FLAG="$T/race" SLACK_MODE=all-threads SELF_KEEP_HUMAN=1 PROBE_CURSOR=$(cat "$ST3/cursor") "$PROBE")
+OUT=$(STUB_RACE_FLAG="$T/race" SLACK_MODE=all-threads PROBE_CURSOR=$(cat "$ST3/cursor") "$PROBE")
 eq "竞态这一轮:晚于快照的都先不交" "$OUT" "[]"
-OUT=$(SLACK_MODE=all-threads SELF_KEEP_HUMAN=1 SNAPSHOT_LAG=0 PROBE_CURSOR=$(cat "$ST3/cursor") "$PROBE")
+OUT=$(SLACK_MODE=all-threads SNAPSHOT_LAG=0 PROBE_CURSOR=$(cat "$ST3/cursor") "$PROBE")
 eq "过了快照之后:顶层和 thread 回复都拿到" "$(echo "$OUT" | jq -c '[.[].body]')" '["读完顶层之后才发的顶层","紧接着回在 thread 里"]'
 SNAPSHOT_LAG=x "$PROBE" >/dev/null 2>&1; eq "SNAPSHOT_LAG 非数字 → exit 3" "$?" "3"
 
 echo "== 缓存文件坏了不会把 thread 全跳过 =="
 for f in "$T/cache"/*.json; do printf '{"%s":"x","%s":{"n":"bad"}}' "$P1" "$P3" > "$f"; done
-OUT=$(SLACK_MODE=all-threads SELF_KEEP_HUMAN=1 PROBE_CURSOR=1000000440.000100 "$PROBE"); rc=$?
+OUT=$(SLACK_MODE=all-threads PROBE_CURSOR=1000000440.000100 "$PROBE"); rc=$?
 eq "照样拉 thread,拿到 R7" "$rc $(echo "$OUT" | jq -c '[.[].id | .[7:10]] | map(select(. == "450"))')" '0 ["450"]'
 
 echo "== 出错 fail closed =="

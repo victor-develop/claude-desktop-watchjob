@@ -1,12 +1,13 @@
 #!/bin/bash
 # 模板共用小库。被 probe-*.sh source。
 #
-# 提供五样:
+# 提供这些:
 #   require_bin CMD...  —— 缺命令时点名报错,并给安装地址
 #   require_env NAME... —— 缺参数时清晰报错退出(会变成循环的 exit 12,详情进 log)
 #   run_with_timeout S cmd... —— 可移植超时。macOS 默认没有 timeout(1),没有就用看门狗兜底
 #   fetch_with_retry S cmd... —— 在上面基础上重试,专治一次性网络抖动
 #   default_bot_re —— 常见 bot 账号的正则,可用 BOT_RE 覆盖
+#   agent_prefixes_json / AGENT_JQ_DEF —— 「自己」只按 agent 前缀认,见文件末尾
 
 # 追加而不是前置:调用方自己的 PATH 优先,标准路径只当兜底
 export PATH="$PATH:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
@@ -98,3 +99,30 @@ fetch_with_retry() {
 
 # `[bot]` 后缀覆盖了 GitHub App;web-flow 是 GitHub 网页端 merge commit 的作者
 default_bot_re='\[bot\]$|^web-flow$'
+
+# ---------- 过滤自己:只按 agent 前缀认,不按账号 ----------
+# agent 往往用你本人的账号发言(Slack / GitHub 都是),所以账号分不出这句话是谁说的。
+# 规则只有一条,所有模板一样:
+#   SELF 名下、以 agent 前缀开头的 → agent 代发的,滤掉(否则自己把自己叫醒,死循环)
+#   SELF 名下、不带前缀的          → 你本人手打的,留着,照样叫醒 agent
+#   别人发的                       → 一律留着,哪怕引用了带前缀的话
+# 没有「SELF 发的全滤掉」这条路:那样会把本人在 thread / PR 里的回复一起吃掉,而且没有任何迹象。
+#
+# 配置(环境变量):
+#   AGENT_PREFIX   agent 前缀,默认 '[ 🐶 Claude:]'。去掉开头空白后按字面 startswith 匹配。
+#                  前缀里的 🐶 和 :dog: 两种写法都认 —— Slack 会把 emoji 存成 :shortcode:
+#   AGENT_MARK     旧名,等于 AGENT_PREFIX(两个都给时 AGENT_PREFIX 优先)
+#   AGENT_MARK_RE  可选,额外一条正则,命中也算 agent 代发(前缀里有别的 emoji 时用)
+#   SELF_KEEP_HUMAN 已废弃:本人手打的现在总是保留。旧配置里留着也不报错,直接忽略
+#
+# 用法(jq 里):
+#   jq --argjson prefixes "$(agent_prefixes_json)" --arg markre "${AGENT_MARK_RE:-}" \
+#      "$AGENT_JQ_DEF"'... | select(.user != $self or (.text | is_agent($prefixes; $markre) | not))'
+agent_prefixes_json() {
+  jq -cn --arg p "${AGENT_PREFIX:-${AGENT_MARK:-[ 🐶 Claude:]}}" \
+    '[$p, ($p | split("🐶") | join(":dog:")), ($p | split(":dog:") | join("🐶"))] | unique'
+}
+AGENT_JQ_DEF='def is_agent($prefixes; $re):
+  (. // "") as $raw | ($raw | sub("^\\s+"; "")) as $t
+  | any($prefixes[]; . as $p | $t | startswith($p))
+    or ($re != "" and ($raw | test($re))); '

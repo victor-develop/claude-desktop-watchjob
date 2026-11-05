@@ -31,7 +31,7 @@
 #                     注意是 **channel ID**,不是对方的 user ID(U...)。
 #                     D 开头的 ID 用 `slackcli conversations list --types im` 查
 #   THREAD_TS   thread 模式必需  父消息的 ts,如 1700000000.000000。其它模式下忽略
-#   SELF        必需  你自己的 Slack user ID(U...)。不填会被自己的消息叫醒,死循环
+#   SELF        必需  你自己的 Slack user ID(U...)。用来认「自己」,规则见下
 #               也可以用 SLACK_SELF —— 跟 GitHub 模板同时用时用它,免得两边互相覆盖
 #   TIMEOUT     可选  单次请求超时秒数,默认 25
 #   BODY_MAX    可选  正文截断长度,默认 280
@@ -44,13 +44,12 @@
 #   EXCLUDE_REPLIES 可选  旧参数,=1 等于 SLACK_MODE=top-level。和 SLACK_MODE=all-threads 同时给会报错
 #   TERMINATE_RE 可选 正则;某条消息命中就报 terminal(比如 '结了|closed|done')
 #
-# 过滤自己(三种模式同一套规则):SELF 发的消息默认全滤掉。agent 用你本人账号发言时,
-# 配一个「agent 前缀」,SELF 发的消息就只滤带前缀的,你本人手打的照样会叫醒 agent:
-#   AGENT_MARK      固定前缀,按字面 startswith 匹配(如 '[ 🤖 agent ]')
-#   AGENT_MARK_RE   同上,按正则匹配。Slack 会把 emoji 存成 :shortcode:,前缀里有 emoji 时
-#                   用它,比如 '^\[ (:dog:|🐶) agent\]'
-#   SELF_KEEP_HUMAN =1 且上面两个都没配时,等于 AGENT_MARK_RE='^\[ (:dog:|🐶) Claude:\]'
-# 别人的消息即使引用了带前缀的话也不会被滤。bot 消息和 join/leave/pin 这类系统消息一律滤掉。
+# 过滤自己(三种模式同一套规则,详见 _lib.sh 末尾):只滤 SELF 名下以 agent 前缀开头的消息,
+# 你本人手打的照样会叫醒 agent;别人的消息即使引用了带前缀的话也不会被滤。
+#   AGENT_PREFIX    agent 前缀,默认 '[ 🐶 Claude:]',🐶 / :dog: 两种写法都认(旧名 AGENT_MARK)
+#   AGENT_MARK_RE   可选,额外一条正则,命中也算 agent 代发
+#   SELF_KEEP_HUMAN 已废弃,忽略
+# bot 消息和 join/leave/pin 这类系统消息一律滤掉。
 #
 # 用法:
 #   export CHANNEL=D0XXXXXXXXX SELF=U0XXXXXXXXX SLACK_MODE=all-threads
@@ -173,10 +172,8 @@ for pair in "MAX_PAGES:$MAX_PAGES" "LIMIT:$LIMIT" "TIMEOUT:$TIMEOUT" "BODY_MAX:$
   esac
 done
 
-MARK="${AGENT_MARK:-}"; MARKRE="${AGENT_MARK_RE:-}"
-if [ -z "$MARK" ] && [ -z "$MARKRE" ] && [ "${SELF_KEEP_HUMAN:-}" = "1" ]; then
-  MARKRE='^\[ (:dog:|🐶) Claude:\]'
-fi
+PREFIXES=$(agent_prefixes_json) || { echo "AGENT_PREFIX 解析失败" >&2; exit 3; }
+MARKRE="${AGENT_MARK_RE:-}"
 
 json_only() {  # 从第一行 { 或 [ 开头的起,到最后一行以 } 或 ] 结尾的止;紧凑排版的 JSON 中间也可能有以 ] 开头的行
   awk '!s && /^[[{]/ {s=1} s {buf[++n]=$0; if ($0 ~ /[]}][[:space:]]*$/) last=n} END {for (i=1; i<=last; i++) print buf[i]}'
@@ -185,15 +182,10 @@ json_only() {  # 从第一行 { 或 [ 开头的起,到最后一行以 } 或 ] �
 # $thread = 正在读的 thread 的父消息 ts(读会话历史时为空)。
 # 是不是回复:读 thread 时看 ts 是否等于父消息 ts —— 不依赖消息体里有没有 thread_ts 字段
 # (0.7 的输出就没有);读会话历史时看 thread_ts。
-NORMALIZE_JQ='
+NORMALIZE_JQ="$AGENT_JQ_DEF"'
   ( [ (.users // [])[] | {key: .id, value: (.real_name // .name)} ] | from_entries ) as $names
   | [ .messages[]
-      | select(.user != $self
-               or (($mark != "" or $markre != "")
-                   and ((.text // "") as $t
-                        | (($mark != "" and ($t | startswith($mark)))
-                           or ($markre != "" and ($t | test($markre))))
-                        | not)))
+      | select(.user != $self or (.text | is_agent($prefixes; $markre) | not))
       | select(.bot_id == null)
       # 滤掉 join/leave/pin 这类系统消息;「同时发到频道」的回复和带文件的消息是人发的,留着
       | select((.subtype // "") as $st | $st == "" or $st == "thread_broadcast" or $st == "file_share")
@@ -208,7 +200,7 @@ NORMALIZE_JQ='
     ] | sort_by(.at)'
 
 normalize() {  # stdin = 一页原始 JSON;$1=thread ts(可空) $2=toponly(true/false)
-  jq -c --arg self "$SELF" --arg mark "$MARK" --arg markre "$MARKRE" --argjson max "$BODY_MAX" \
+  jq -c --arg self "$SELF" --argjson prefixes "$PREFIXES" --arg markre "$MARKRE" --argjson max "$BODY_MAX" \
         --arg thread "$1" --argjson toponly "$2" "$NORMALIZE_JQ"
 }
 
@@ -333,9 +325,9 @@ else
       || { echo "slackcli 输出结构不符合预期(扫 thread 列表),先手跑一次确认字段名" >&2; exit 3; }
 
     # 缓存:{ "<父消息 ts>": {n: reply_count, last: 会叫醒你的回复的 ts 上界, stable: 这个 n 是否已连续拉到两次} }
-    # 「会叫醒你」取决于过滤规则,所以文件名里带 SELF / AGENT_MARK / AGENT_MARK_RE 的摘要
+    # 「会叫醒你」取决于过滤规则,所以文件名里带 SELF / agent 前缀 / AGENT_MARK_RE 的摘要
     cache_dir="${THREAD_CACHE_DIR:-${TMPDIR:-/tmp}/incremental-watch-slack}"
-    fkey=$(printf '%s|%s|%s' "$SELF" "$MARK" "$MARKRE" | cksum | cut -d' ' -f1)
+    fkey=$(printf '%s|%s|%s' "$SELF" "$PREFIXES" "$MARKRE" | cksum | cut -d' ' -f1)
     cache_file="$cache_dir/threads-${CHANNEL//[^A-Za-z0-9_-]/_}-$fkey.json"
     # 坏掉的条目一律丢掉(当没缓存,多拉而已),不能让它把整个计划搞崩
     cache=$(jq -c 'if type == "object" then with_entries(select(.value | type == "object"
