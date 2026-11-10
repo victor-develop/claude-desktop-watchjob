@@ -90,6 +90,8 @@ if [ -n "$NOTE_FILE" ]; then
   [ -f "$NOTE_FILE" ] || { echo "--note-file 不存在: $NOTE_FILE" >&2; exit 1; }
   NOTE=$(cat "$NOTE_FILE")
   [ -n "$NOTE" ] || { echo "--note-file 是空的" >&2; exit 1; }
+  # 说明会包进 <relay> 标签交给模型,别人写的内容(发送人名字之类)可能带标签,尖括号换成全角
+  NOTE=${NOTE//</＜}; NOTE=${NOTE//>/＞}
   STATE_DIR=$(cd "$(dirname "$NOTE_FILE")" && pwd)
 else
   [[ "$NAME" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] || { echo "--name 不合法: '$NAME'" >&2; exit 1; }
@@ -161,7 +163,7 @@ $NOTE
   local pf rc; pf=$(mktemp); printf '%s' "$prompt" > "$pf"
   out=$(cd "$STATE_DIR" && run_with_timeout "${WATCH_RELAY_TIMEOUT:-120}" bash -c '"$@" < "$0"' "$pf" \
     "${WATCH_RELAY_CLAUDE:-claude}" -p --model "${WATCH_RELAY_MODEL:-haiku}" --output-format json \
-      --strict-mcp-config --no-session-persistence -n "watch 投递" \
+      --strict-mcp-config --no-session-persistence -n "watch 投递" --settings '{"disableAllHooks":true}' \
       --permission-mode "$PERM" --tools SendMessage); rc=$?
   rm -f "$pf"
   [ $rc -eq 0 ] || { echo "claude -p 失败(rc=$rc): $(printf '%s' "$out" | tail -c 300)" >&2; return 1; }

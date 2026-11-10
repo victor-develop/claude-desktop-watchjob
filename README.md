@@ -266,7 +266,7 @@ judgment call.
 ./tests/test-ack.sh             # 21 assertions: watch-ack contract, lock takeover, no lost items when racing the loop
 ./tests/test-slack-modes.sh     # 51 assertions: the three Slack modes, thread-reply pickup, cursor, skipped unchanged threads
 ./tests/test-relay.sh           # 38 assertions: --relay delivery, queue and retry, delivery before exit, id lookup, wake via link, permission mode, --note-file
-./tests/test-slack-live.sh      # 36 assertions: slack-live filtering, triage skip rules, backfill dedup, agent prefix, links, group cache, retry after restart
+./tests/test-slack-live.sh      # 44 assertions: slack-live filtering, triage skip rules and retry, backfill dedup and seen expiry, agent prefix, links, group cache, sender sanitizing, retry after restart
 ./tests/test-timeout.sh         #  6 assertions: run_with_timeout without timeout(1) kills the whole process group
 ```
 

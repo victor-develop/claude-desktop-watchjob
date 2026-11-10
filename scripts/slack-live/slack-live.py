@@ -58,7 +58,12 @@ AGENT_PREFIXES = {_prefix, _prefix.replace("🐶", ":dog:"), _prefix.replace(":d
 AGENT_MARK_RE = re.compile(os.environ["AGENT_MARK_RE"]) if os.environ.get("AGENT_MARK_RE") else None
 # 消息链接用的工作区地址;不给时从 search 结果的 permalink 里学
 WORKSPACE_URL = os.environ.get("SLACK_WORKSPACE_URL", "").rstrip("/")
-SEEN_CAP = 500
+# seen 记每个 ts 最近一次在实时通道或补拉结果里出现的时间,超过 SEEN_DAYS 天没再出现才淘汰。
+# 不能按条数截:冷门搜索语句的结果会在前 20 条里留很久,截掉后每轮补拉都会再投一次
+SEEN_DAYS = int(os.environ.get("SEEN_DAYS", "14"))
+# 初判失败的消息隔多久重试、最多试几次。只在内存里,重启就不再试
+TRIAGE_RETRY_SECONDS = int(os.environ.get("TRIAGE_RETRY_SECONDS", "120"))
+TRIAGE_MAX_TRIES = 3
 # 查我在哪些组要逐个读组成员,组多时要几分钟,所以结果缓存在 groups.json 里,隔几个小时才重查
 GROUPS_REFRESH_SECONDS = int(os.environ.get("GROUPS_REFRESH_SECONDS", "21600"))
 THREAD_CONTEXT_MESSAGES = 8
@@ -117,7 +122,7 @@ def search(query):
 
 
 def thread_messages(channel_id, thread_ts):
-    body = slackcli("conversations read", ("--thread-ts", thread_ts), ("--limit", 200),
+    body = slackcli("conversations read", ("--thread-ts", thread_ts), ("--limit", 1000),
                     ("--fields", "ts,user,username,text"), channel_id) or {}
     for u in body.get("users") or []:
         if u.get("id") and u.get("name"):
@@ -130,7 +135,28 @@ def load_state():
         with open(STATE_FILE) as f:
             return json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
-        return {"seen": [], "started_at": time.time()}
+        return {"seen": {}, "started_at": time.time()}
+
+
+def seen_map(state):
+    """旧版 state.json 的 seen 是 ts 列表,读到时转成 {ts: 时间}。"""
+    seen = state.get("seen")
+    if not isinstance(seen, dict):
+        now = time.time()
+        seen = {ts: now for ts in (seen or [])}
+        state["seen"] = seen
+    return seen
+
+
+def mark_seen(state, ts):
+    seen_map(state)[ts] = time.time()
+
+
+def prune_seen(state):
+    cutoff = time.time() - SEEN_DAYS * 86400
+    seen = seen_map(state)
+    for ts in [t for t, at in seen.items() if at < cutoff]:
+        del seen[ts]
 
 
 def save_state(state):
@@ -209,7 +235,7 @@ class Resident:
         self.proc = subprocess.Popen(
             [*CLAUDE_CMD, "-p", "--model", TRIAGE_MODEL, "--input-format", "stream-json",
              "--output-format", "stream-json", "--verbose", "--strict-mcp-config",
-             "--no-session-persistence", *self.args],
+             "--no-session-persistence", "--settings", NO_HOOKS, *self.args],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=STATE_DIR,
         )
         self.lines = queue.Queue()
@@ -250,13 +276,20 @@ class Resident:
             self._start()
         try:
             result = self._turn(prompt, timeout)
-            self._turn("/clear", 30)
-            return result
         except Exception as e:
             self.stop()
             raise RuntimeError(f"{self.name} 常驻进程出错,已停掉,下次重启: {e}") from e
+        try:
+            self._turn("/clear", 30)
+        except Exception as e:
+            # 结论已经拿到了,只是上下文没清掉:停掉进程,下次重启就是干净的
+            log(f"{self.name} /clear 失败,停掉进程,下次重启: {e}")
+            self.stop()
+        return result
 
 
+# 不加载用户的 hooks:初判 prompt 里有 Slack 原文,hook(比如记忆类插件)会把它带到别处去
+NO_HOOKS = json.dumps({"disableAllHooks": True}, separators=(",", ":"))
 TRIAGE_WORKER = Resident("初判", ["--tools", ""])
 
 
@@ -297,7 +330,7 @@ def triage(msg, me_id):
     if not match:
         raise RuntimeError(f"初判输出不是 JSON: {text[:200]}")
     verdict = json.loads(match.group(0))
-    reason = re.sub(r"\s+", " ", str(verdict.get("reason", "")))[:60]
+    reason = plain(re.sub(r"\s+", " ", str(verdict.get("reason", ""))), 60)
     return bool(verdict.get("need")), reason
 
 
@@ -344,8 +377,25 @@ def follow_thread(msg, state):
         del threads[key]
 
 
+def plain(text, limit):
+    """进投递说明的外部字符串只留字母数字和少量标点:机器人的 username 是对方自己设的,
+    带上尖括号、引号就能冒充说明里的结构,影响投递用的模型。"""
+    return re.sub(r"[^\w.\- ,，。:：()?？!！]", "", str(text or ""))[:limit]
+
+
+def sender_label(msg):
+    user_id = msg.get("user") if re.fullmatch(r"[UWB][A-Z0-9]+", msg.get("user") or "") else ""
+    name = plain(msg.get("username"), 40)
+    return " ".join(p for p in (name, f"({user_id})" if user_id else "") if p) or "未知发送人"
+
+
+def is_bot(msg):
+    # Slackbot 的提醒和系统通知没有 bot_id,按 user id 认
+    return bool(msg.get("bot_id")) or msg.get("subtype") == "bot_message" or msg.get("user") == "USLACKBOT"
+
+
 def build_note(msg, reason):
-    sender = msg.get("username") or msg.get("user", "")
+    sender = sender_label(msg)
     channel_id = (msg.get("channel") or {}).get("id", "")
     return (
         "这是用户本人的 Slack 监听转来的消息,用户要你替他处理:先用 Slack 工具读原文和完整线程,"
@@ -357,9 +407,13 @@ def build_note(msg, reason):
 
 
 def relay(msg, reason):
+    return relay_note(build_note(msg, reason))
+
+
+def relay_note(note):
     """交给 watch-relay.sh 投递:收件地址解析、唤醒、权限模式都在那边。"""
     with tempfile.NamedTemporaryFile("w", dir=STATE_DIR, prefix="note.", suffix=".txt", delete=False) as f:
-        f.write(build_note(msg, reason))
+        f.write(note)
         path = f.name
     try:
         proc = subprocess.run([RELAY_CMD, "--note-file", path], capture_output=True, text=True, timeout=600)
@@ -373,7 +427,7 @@ def relay(msg, reason):
 def handle(msg, me_id, state):
     if msg.get("_self"):
         need, reason = True, "我自己 @ 了自己,直接交给目标会话"
-    elif is_dm(msg) and not msg.get("bot_id") and msg.get("subtype") != "bot_message":
+    elif is_dm(msg) and not is_bot(msg):
         # 真人私聊量小且基本都冲我来,小模型只看开头容易把长消息判成知会,直接交给目标会话
         need, reason = True, "真人私聊,直接交给目标会话"
     elif not (msg.get("text") or "").strip() and msg.get("files"):
@@ -437,34 +491,61 @@ def screen(msg, me_id, groups, started_at, threads=None):
     if hit_keyword:
         log(f"跳过 {ts},附件含 {hit_keyword}")
         return False
-    if (msg.get("username") or "").lower() in SKIP_SENDERS:
-        log(f"跳过 {ts},发送人 {msg.get('username')} 在 SKIP_SENDERS 里")
-        return False
     msg["_direct"] = f"<@{me_id}>" in text
     if not is_dm(msg) and not msg["_direct"]:
         hit = [h for gid, h in groups.items() if f"<@{gid}>" in text or f"<!subteam^{gid}" in text]
         if hit:
             msg["_group"] = hit[0]
-        elif msg.get("thread_ts") and not msg.get("bot_id") and thread_key(msg) in (threads or {}):
+        elif msg.get("thread_ts") and not is_bot(msg) and thread_key(msg) in (threads or {}):
             msg["_followup"] = True
         else:
+            return False
+    # 跳过名单放在最后:实时通道里真人消息不带 username,要查一次,只给过了上面几关的消息查
+    if SKIP_SENDERS:
+        if not msg.get("username") and msg.get("user"):
+            msg["username"] = user_name(msg["user"])
+        if (msg.get("username") or "").lower() in SKIP_SENDERS:
+            log(f"跳过 {ts},发送人 {msg.get('username')} 在 SKIP_SENDERS 里")
             return False
     return True
 
 
+RETRY = []
+
+
 def process(msgs, me_id, state):
-    seen = set(state["seen"])
+    seen = seen_map(state)
     for msg in sorted(msgs, key=lambda m: float(m["ts"])):
         if msg["ts"] in seen:
             continue
         log(f"新消息({describe(msg)}){msg['ts']} 来自 {msg.get('username') or msg.get('user')}")
-        try:
-            handle(msg, me_id, state)
-        except Exception as e:
-            log(f"处理失败 {msg['ts']}: {e}")
-            continue
-        seen.add(msg["ts"])
-    state["seen"] = sorted(seen)[-SEEN_CAP:]
+        attempt(msg, me_id, state, tries=0)
+    prune_seen(state)
+    save_state(state)
+
+
+def attempt(msg, me_id, state, tries):
+    """处理一条;失败(多半是初判进程出错)时记进 seen,免得补拉每轮重判,改由 RETRY 隔一会儿再试。
+    thread 后续消息补拉搜不到,只能靠这里重试。"""
+    mark_seen(state, msg["ts"])
+    try:
+        handle(msg, me_id, state)
+    except Exception as e:
+        tries += 1
+        if tries >= TRIAGE_MAX_TRIES:
+            log(f"处理失败 {tries} 次,放弃 {msg['ts']}: {e}")
+            return
+        log(f"处理失败,{TRIAGE_RETRY_SECONDS * tries} 秒后重试 {msg['ts']}: {e}")
+        RETRY.append({"msg": msg, "tries": tries, "next_at": time.time() + TRIAGE_RETRY_SECONDS * tries})
+
+
+def flush_retries(me_id, state):
+    due = [r for r in RETRY if r["next_at"] <= time.time()]
+    if not due:
+        return
+    for r in due:
+        RETRY.remove(r)
+        attempt(r["msg"], me_id, state, r["tries"])
     save_state(state)
 
 
@@ -475,7 +556,7 @@ def from_rtm(ev, me_id, groups, state):
     channel_id = ev["channel"]
     msg = {k: ev[k] for k in ("ts", "thread_ts", "user", "username", "bot_id", "subtype", "text", "attachments", "files") if ev.get(k)}
     msg["channel"] = {"id": channel_id, "is_im": channel_id.startswith("D")}
-    if msg["ts"] in state["seen"] or not screen(msg, me_id, groups, state["started_at"], state.get("threads")):
+    if msg["ts"] in seen_map(state) or not screen(msg, me_id, groups, state["started_at"], state.get("threads")):
         return None
     msg["permalink"] = permalink(channel_id, msg["ts"], msg.get("thread_ts"), state)
     if not msg.get("username") and msg.get("user"):
@@ -522,17 +603,19 @@ def backfill(me_id, queries, state, groups):
     for q in queries:
         matches.extend(search(q))
     learn_workspace_url(matches, state)
-    seen = set(state["seen"])
+    seen = seen_map(state)
     fresh = {}
     for msg in matches:
         ts = msg.get("ts")
-        if not ts or ts in seen or ts in fresh:
+        if not ts or ts in fresh:
+            continue
+        if ts in seen:
+            seen[ts] = time.time()  # 还在搜索结果里,续期
             continue
         if screen(msg, me_id, groups, state["started_at"]):
             fresh[ts] = msg
         else:
-            seen.add(ts)
-    state["seen"] = sorted(seen)[-SEEN_CAP:]
+            mark_seen(state, ts)
     if fresh:
         log(f"补拉到 {len(fresh)} 条实时通道没收到的消息")
     process(list(fresh.values()), me_id, state)
@@ -563,7 +646,8 @@ def main():
         sys.exit(1)
     listen_help = subprocess.run([*SLACKCLI, "messages", "listen", "--help"], capture_output=True, text=True,
                                  env=slackcli_env())
-    if listen_help.returncode != 0:
+    # 不认识的子命令 commander 也是打组帮助、退出 0,所以看输出里有没有 listen 自己的 Usage
+    if listen_help.returncode != 0 or "messages listen" not in listen_help.stdout:
         log("这个 slackcli 没有 messages listen 子命令,装带 listen 的版本,见 references/slack-live.md")
         sys.exit(1)
     try:
@@ -587,12 +671,27 @@ def main():
         TRIAGE_WORKER.stop()
 
 
+def alert_listen_down():
+    """listen 连着几次一起来就退出(多半是登录态失效或 slackcli 换回了没有 listen 的版本),告诉目标会话一声。"""
+    note = ("这是用户本人的 Slack 监听发来的告警:slackcli messages listen 连续启动失败,实时通道停了,"
+            f"现在只剩每 {BACKFILL_SECONDS} 秒一次的 search 补拉(收不到 thread 后续消息)。"
+            f"请提醒用户看日志 {LOG_FILE},常见原因是 slackcli 登录态失效,或者 slackcli update 换回了没有 listen 的版本。"
+            "不要发 Slack 消息,不要改文件。")
+    try:
+        relay_note(note)
+        log("已向目标会话发出 listen 连续失败的告警")
+        return True
+    except Exception as e:
+        log(f"listen 告警投递失败,下次再试: {e}")
+        return False
+
+
 def run(me_id, queries, exit_on_eof, listener):
     state = load_state()
     groups, groups_loaded_at = {}, 0.0
     proc, events = start_listener()
     listener["proc"] = proc
-    listener_started, restart_wait = time.time(), 5
+    listener_started, restart_wait, alerted = time.time(), 5, False
     backfill_due = time.time() + BACKFILL_SECONDS
     streams_open = 2
     while True:
@@ -613,12 +712,18 @@ def run(me_id, queries, exit_on_eof, listener):
             if streams_open == 0:
                 proc.wait()
                 if exit_on_eof:
+                    flush_retries(me_id, state)
                     flush_pending(state)
                     log("事件流读完,退出")
                     return
                 # 网络断线 listen 自己会重连;它退出多半是登录态失效,很快又退出时拉长间隔,别刷屏
-                restart_wait = 5 if time.time() - listener_started > 60 else min(restart_wait * 2, 300)
+                if time.time() - listener_started > 60:
+                    restart_wait, alerted = 5, False
+                else:
+                    restart_wait = min(restart_wait * 2, 300)
                 log(f"messages listen 退出 code={proc.returncode},{restart_wait} 秒后重启")
+                if restart_wait == 300 and not alerted:
+                    alerted = alert_listen_down()
                 time.sleep(restart_wait)
                 proc, events = start_listener()
                 listener["proc"] = proc
@@ -627,11 +732,15 @@ def run(me_id, queries, exit_on_eof, listener):
         elif kind == "stderr":
             log(f"listen: {line.strip()[:300]}")
         elif kind == "event":
-            ev = json.loads(line)
-            if ev["type"] == "hello":
+            try:
+                ev = json.loads(line)
+            except ValueError:
+                log(f"listen 输出了一行不是 JSON 的内容,跳过: {line.strip()[:100]}")
+                continue
+            if ev.get("type") == "hello":
                 log("listen 已连上")
                 backfill_due = time.time()  # 刚连上或重连,补拉断线期间的消息
-            elif ev["type"] == "message":
+            elif ev.get("type") == "message":
                 try:
                     msg = from_rtm(ev, me_id, groups, state)
                     if msg:
@@ -639,9 +748,10 @@ def run(me_id, queries, exit_on_eof, listener):
                 except Exception as e:
                     log(f"处理实时消息失败 {ev.get('ts')}: {e}")
         try:
+            flush_retries(me_id, state)
             flush_pending(state)
         except Exception as e:
-            log(f"重投出错: {e}")
+            log(f"重试或重投出错: {e}")
         if time.time() >= backfill_due:
             try:
                 backfill(me_id, queries + [f"@{h}" for h in sorted(groups.values())], state, groups)
