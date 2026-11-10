@@ -278,7 +278,7 @@ WATCH_TARGET_SESSION_LINK="claude://claude.ai/epitaxy/local_<会话 id>" \
 - `scripts/watch-ack.sh` —— 处理完后按 id 从 inbox 删项,和循环共用 inbox 锁;`scripts/inbox-lock.sh` 是两边共用的锁和原子写
 - `scripts/templates/` —— 现成 probe(GitHub PR / CI checks / Slack 三种模式 /
   PR+Slack 合并 / HTTP JSON),配置走环境变量,直接可用。`_lib.sh` 里有 `require_env` 和 `run_with_timeout`
-- `scripts/slack-live/` —— Slack 实时监听模板:WebSocket 收消息、本地过滤(私聊 / @我 / @我所在的组 / 投递过的
+- `scripts/slack-live/` —— Slack 实时监听模板:`slackcli messages listen` 收消息、本地过滤(私聊 / @我 / @我所在的组 / 投递过的
   thread 后续)、haiku 初判、经 `watch-relay.sh --note-file` 投递进一个会话。用户要「Slack 上找我的消息都实时
   转给某个会话」时用它,而不是给每个频道开一个 watch。配置和前置依赖见 `references/slack-live.md`
 - `references/sources.md` —— 怎么挑模板、怎么自己写一个
