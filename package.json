@@ -1,0 +1,14 @@
+{
+  "name": "incremental-watch",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "WS 事件缓冲 daemon 的依赖。轮询那条路是纯 bash,不需要装任何东西。",
+  "engines": {
+    "node": ">=20.10"
+  },
+  "dependencies": {
+    "gabriel-slack": "0.1.1",
+    "ws": "^8.18.0"
+  }
+}

@@ -43,6 +43,9 @@
 #   SNAPSHOT_LAG 可选 all-threads 模式的快照滞后秒数,默认 10(见下)
 #   EXCLUDE_REPLIES 可选  旧参数,=1 等于 SLACK_MODE=top-level。和 SLACK_MODE=all-threads 同时给会报错
 #   TERMINATE_RE 可选 正则;某条消息命中就报 terminal(比如 '结了|closed|done')
+#   SLACK_WS    可选  =1 时优先读 WS 事件缓冲,读不了再退回轮询(默认 0,纯轮询)。
+#                     要先跑常驻的 scripts/slack-ws-daemon.mjs,详见 _slack_ws.sh 顶部
+#   SLACK_WS_DIR / SLACK_WS_STALE / SLACK_WS_VERIFY  见 _slack_ws.sh
 #
 # 过滤自己(三种模式同一套规则,详见 _lib.sh 末尾):只滤 SELF 名下以 agent 前缀开头的消息,
 # 你本人手打的照样会叫醒 agent;别人的消息即使引用了带前缀的话也不会被滤。
@@ -106,12 +109,26 @@
 # CLI 会把进度行("- Fetching messages...")打到 stdout,偶尔还会在 JSON **后面**追一段
 # "Update available: ..." 升级提示。json_only 只留从第一个 { 到最后一个 } 结尾的行。
 #
+# WS 模式(SLACK_WS=1)省的是什么,别记错:
+#   省的是**接口调用次数和到达延迟**,不是 token。循环空转在 shell 里,本来就不花 token;
+#   这套机制的成本全在唤醒上,WS 一分钱也省不掉 —— 要少唤醒还是得靠 interval 和过滤。
+#   省调用这件事在 all-threads 模式下最明显:轮询每轮 2 次起步,有新回复的 thread 再各 2 轮;
+#   WS 稳态 0 次,而且 thread 回复是直接推过来的,不受 THREAD_SCAN 那个上限约束
+#   (轮询看不到更早的顶层消息底下的新回复,WS 看得到)。
+#   WS 不是真相源:断线期间的帧网页版不补发,所以缓冲只敢声称从 covered_from 起是全的,
+#   游标比它早就这一轮照常轮询补齐;只信 daemon 成员名单里的频道;另外每 SLACK_WS_VERIFY
+#   秒强制轮询校验一次。
+#   WS 模式下 SNAPSHOT_LAG 也生效,而且它是整条链路**唯一**的乱序缓冲:同一频道里一条帧比
+#   它之后的帧晚到超过 SNAPSHOT_LAG 秒,就会被后面那条顶过去的游标永久跳过。10 秒对正常的
+#   WS 推送够用,要更保险就调大。
+#
 # slackcli 版本:thread 模式验证过 0.7.x / 0.9.x / 0.14.x(0.7 只有 `messages` 子命令,自动回退,
 # 但不能翻页,取满 LIMIT 就 fail closed);其它两种模式验证过 0.9.x / 0.14.x,不做 0.7 回退。其它版本 fail closed,
 # 手跑确认 JSON 结构没变后用 SLACKCLI_ALLOW_UNTESTED=1 放行。
 
 set -uo pipefail
 . "$(dirname "$0")/_lib.sh"
+. "$(dirname "$0")/_slack_ws.sh"
 require_bin slackcli jq
 SELF="${SLACK_SELF:-${SELF:-}}"
 
@@ -302,8 +319,22 @@ WORK=$(mktemp -d) || exit 3
 trap 'rm -rf "$WORK"' EXIT
 add_items() { printf '%s\n' "$1" >> "$WORK/items"; }   # 每行一个数组,最后 jq -s 合并
 
+# ---------- WS 缓冲:能服务这一轮就一次接口都不打 ----------
+# 不能服务的三种情况(daemon 没起 / 游标早于 covered_from / 到校验时刻)都会退回下面的
+# 轮询,并在 stderr 留一行原因。退回是常态,不是错误 —— 轮询那条路本身就是正确性的底线。
+WS_SERVED=0
+if ws_enabled && ws_can_serve "$CUR"; then
+  if ITEMS=$(ws_read_items "$CUR"); then
+    WS_SERVED=1
+  else
+    echo "WS 缓冲读取失败,这轮退回轮询" >&2
+  fi
+fi
+
+if [ "$WS_SERVED" = "1" ]; then
+  : # 项已经在 ITEMS 里
 # ---------- thread 模式 ----------
-if [ "$MODE" = "thread" ]; then
+elif [ "$MODE" = "thread" ]; then
   read_thread "$THREAD_TS" "$CUR" || exit 3
   add_items "$OUT"
 else
@@ -368,11 +399,14 @@ else
   fi
 fi
 
-ITEMS=$(jq -cs 'add // [] | unique_by(.id) | sort_by(.at)' "$WORK/items") \
-  || { echo "合并结果失败" >&2; exit 3; }
+if [ "$WS_SERVED" != "1" ]; then
+  ITEMS=$(jq -cs 'add // [] | unique_by(.id) | sort_by(.at)' "$WORK/items") \
+    || { echo "合并结果失败" >&2; exit 3; }
+fi
 
-# all-threads:晚于快照的这一轮先不交(见头注释),下一轮再给
-if [ "$MODE" = "all-threads" ]; then
+# 晚于快照的这一轮先不交(见头注释),下一轮再给。
+# all-threads 是因为一轮要读好几次;WS 是因为重连后的补发可能带来比刚写进去的更早的帧。
+if [ "$MODE" = "all-threads" ] || [ "$WS_SERVED" = "1" ]; then
   ITEMS=$(printf '%s' "$ITEMS" | jq -c --argjson snap "$SNAP" 'map(select((.at | tonumber) <= $snap))')
 fi
 
