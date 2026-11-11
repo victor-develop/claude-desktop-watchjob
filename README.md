@@ -243,6 +243,54 @@ The corollary is the nice part: if the loop dies, gets killed, or the probe brea
 finds out immediately. Silent failure is the usual curse of watch tooling, and this shape doesn't
 have it.
 
+## Optional: WebSocket event buffer (`SLACK_WS=1`)
+
+Set expectations first: this design spends its budget on *wake-ups*, and an idle loop sleeping in a
+shell costs no tokens at all — so a WebSocket saves exactly zero tokens. What it buys is different:
+
+| | Polling (default) | WS buffer |
+|---|---|---|
+| Tokens while idle | 0 | 0 (**no difference**) |
+| Slack API calls | 1 per poll (`top-level`) to 2+N (`all-threads`) | 0 in steady state; only for catch-up and periodic verification |
+| Arrival | up to one `--interval` | seconds into the buffer (the agent still wakes on the next poll) |
+| Thread replies | bounded by `THREAD_SCAN`; new replies under older top-level messages are invisible | pushed directly, no such bound |
+| Cost | none | one long-lived node process and one npm dependency |
+
+The shape is a daemon plus a thin probe: `scripts/slack-ws-daemon.mjs` holds one WebSocket for the
+whole workspace and appends messages to a local event file; probes read that file and emit the same
+item shape and cursor as polling. **One connection serves every watch** — that is where the value
+is, and it grows with the number of channels you watch.
+
+```bash
+npm install --prefix ~/.claude/skills/incremental-watch --omit=dev
+nohup node ~/.claude/skills/incremental-watch/scripts/slack-ws-daemon.mjs >/dev/null 2>&1 & disown
+export SLACK_WS=1   # nothing else about your watches changes
+```
+
+Credentials are the ones slackcli already uses (a browser session — `slackcli auth list` shows
+`Auth: 🌐 Browser`). No Slack app is needed; Socket Mode would require an app-level token, and a bot
+cannot see your DMs at all.
+
+**It is not a source of truth, and it does not replace polling.** The probe falls back to polling —
+logging one line in the watch's log each time — in four cases:
+
+1. the daemon is down, its status is stale, or the session died;
+2. **the channel is not one you are a member of.** The socket only pushes conversations you belong
+   to, while polling with a user token reads public channels you never joined. Without this check,
+   watching such a channel looks like "daemon healthy, nothing ever arrives" — a permanent silent
+   miss. The daemon writes its `users.conversations` result to `channels.json`; no list means no trust;
+3. the cursor predates `covered_from`, since the socket does not replay what was missed while
+   disconnected (seeding takes this path too);
+4. every `SLACK_WS_VERIFY` seconds (default 1800), as a verification poll — because "frames stopped
+   arriving" is invisible to the buffer, which would just report "nothing new" forever. This drops
+   the savings from 100% of calls to roughly 94% in exchange for a bounded miss window.
+
+Two assumptions worth remembering: `covered_from` is computed from the local clock while cursors are
+Slack's server-side timestamps, so it is pushed forward by `SLACK_WS_SKEW_MARGIN` (120s) — moving it
+later only costs extra polls, moving it earlier loses messages permanently. And `SNAPSHOT_LAG`
+(default 10s) is the only reordering buffer in the WS path: a frame arriving later than that behind
+its successors is skipped by the cursor they advanced.
+
 ## Cost model
 
 Almost all the cost is in *waking up*, not in polling. Two levers, and the second one is the one
@@ -260,6 +308,7 @@ judgment call.
 ## Tests
 
 ```bash
+./tests/test-slack-ws.sh        # 28 assertions: WS buffer serves, and every fallback to polling
 ./tests/test-exit-codes.sh      # 28 assertions: exit-code contract, cursor, inbox safety
 ./tests/test-parallel.sh 5      #  8 assertions: N loops stay isolated
 ./tests/test-templates.sh       # 68 assertions: template filtering, pagination, failure propagation

@@ -79,6 +79,53 @@ probe 是一个可执行脚本,唯一职责:**把当前状态压成一个 JSON �
   `EXCLUDE_REPLIES=1` 时 = `top-level`)还能用,已经在跑的 watch 不用改
 - 「自己」只按 agent 前缀认,见下面「过滤自己」。三种模式同一套规则
 
+**可选:WS 事件缓冲(`SLACK_WS=1`)——— 省接口调用和延迟,不省 token。**
+
+先把期待放平:这套机制的成本全在**唤醒**上,循环空转在 shell 里本来就不花 token,所以
+WS 一分钱 token 也省不掉。它换来的是两件别的东西:
+
+| | 轮询(默认) | WS 缓冲 |
+|---|---|---|
+| token | 空转 0 | 空转 0(**没有差别**) |
+| Slack 接口调用 | 每轮 1 次(top-level)到 2+N 次(all-threads) | 稳态 0,只在补齐和定期校验时打 |
+| 消息到达 | 最多一个 `--interval` | 秒级进缓冲(但仍要等下一轮 probe 才叫醒你) |
+| thread 回复 | 受 `THREAD_SCAN` 限制,更早的顶层消息底下的新回复看不到 | 直接推过来,没有这个上限 |
+| 代价 | 无 | 多一个常驻 node 进程 + 一个 npm 依赖 |
+
+形状是「一个 daemon + 瘦 probe」:`scripts/slack-ws-daemon.mjs` 用一条 WebSocket 收下整个
+工作区的消息,写成本地事件文件;probe 从文件里读,形状和游标跟轮询完全一样。**一条连接
+服务所有 watch** —— 这才是它真正值钱的地方,盯的频道越多越划算。
+
+```bash
+npm install --prefix ~/.claude/skills/incremental-watch --omit=dev   # 只装 gabriel-slack + ws
+nohup node ~/.claude/skills/incremental-watch/scripts/slack-ws-daemon.mjs >/dev/null 2>&1 & disown
+# 然后给 Slack 的 watch 加一个环境变量就行,别的都不用改
+export SLACK_WS=1
+```
+
+`probe-pr-and-slack.sh` 用不上它:那个模板把两个源的时间戳归一成了 ISO8601,游标不是 Slack ts,
+每轮都会退回轮询 —— 行为是对的,只是别指望它省调用。
+
+凭据跟 slackcli 是同一套(浏览器会话,`slackcli auth list` 显示 `Auth: 🌐 Browser`),不需要
+申请 Slack app —— Socket Mode 那条路要 app-level token,而且 bot 看不到你的 DM,盯 DM 直接废掉。
+
+**它不是真相源,轮询不会被替掉。** 四种情况 probe 自动退回轮询,每次都在 watch 的 log 里
+留一行原因:
+
+1. daemon 没起、状态过期、或者会话失效
+2. **这个频道不在 daemon 的成员名单里** —— WS 只推你是成员的会话,而轮询用 user token 连
+   没加入的公共频道也读得到。不比对的话,盯这种频道就是「daemon 一切正常 + 一条都收不到」,
+   每轮报「没有新消息」。daemon 把 `users.conversations` 的结果写成 `channels.json`,拿不到就一律轮询
+3. 游标早于 `covered_from` —— 断线期间的帧网页版不补发,这段缓冲是空的。seed 也走这条
+4. 到了定期校验时刻(`SLACK_WS_VERIFY`,默认 1800 秒)。这是防「帧莫名其妙没推过来」的兜底:
+   缓冲自己看不出这种失效,只会一直说「没有新消息」。代价是省下的调用从 100% 降到约 94%,
+   换一个有上界的漏消息窗口
+
+还有两个前提值得记住:`covered_from` 用本机时钟算、游标是 Slack 服务端的 ts,所以它默认
+往后推 `SLACK_WS_SKEW_MARGIN`(120 秒)—— 推晚只是多轮询几轮,推早会**永久丢消息**。另外
+`SNAPSHOT_LAG`(默认 10 秒)在 WS 模式下是整条链路唯一的乱序缓冲,帧晚到超过它就会被
+后来者顶过去的游标跳过。
+
 配置全走环境变量,直接把模板当 `--probe` 用,不用改文件。变量从启动 `watch-loop.sh` 的
 shell 继承,所以要在同一条命令里 export。每个模板顶部注释是完整用法。
 
@@ -278,6 +325,9 @@ WATCH_TARGET_SESSION_LINK="claude://claude.ai/epitaxy/local_<会话 id>" \
 - `scripts/watch-ack.sh` —— 处理完后按 id 从 inbox 删项,和循环共用 inbox 锁;`scripts/inbox-lock.sh` 是两边共用的锁和原子写
 - `scripts/templates/` —— 现成 probe(GitHub PR / CI checks / Slack 三种模式 /
   PR+Slack 合并 / HTTP JSON),配置走环境变量,直接可用。`_lib.sh` 里有 `require_env` 和 `run_with_timeout`
+- `scripts/slack-ws-daemon.mjs` —— 可选的 Slack WS 事件缓冲 daemon(见上面 `SLACK_WS=1`)。
+  一条连接收整个工作区,写本地事件文件;`scripts/templates/_slack_ws.sh` 是 probe 那一侧的读取
+  和「敢不敢信缓冲」的判断。不开 WS 时这两个文件完全不参与,轮询那条路仍是纯 bash、零依赖
 - `scripts/slack-live/` —— Slack 实时监听模板:`slackcli messages listen` 收消息、本地过滤(私聊 / @我 / @我所在的组 / 投递过的
   thread 后续)、haiku 初判、经 `watch-relay.sh --note-file` 投递进一个会话。用户要「Slack 上找我的消息都实时
   转给某个会话」时用它,而不是给每个频道开一个 watch。配置和前置依赖见 `references/slack-live.md`

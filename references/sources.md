@@ -37,6 +37,12 @@ slackcli 的 JSON 不带)用它和游标比;否则在 `THREAD_CACHE_DIR` 记一�
 `EXCLUDE_REPLIES=1` 时 = `top-level`)还在,是转给 `probe-slack.sh` 的兼容入口,已经在跑的
 watch 不用改。
 
+**可选的 WS 缓冲(`SLACK_WS=1`)**:常驻 `scripts/slack-ws-daemon.mjs` 用一条 WebSocket 收下整个
+工作区的消息写成本地事件文件,probe 从文件读,游标和输出形状都不变,三种模式都支持。省的是
+接口调用和到达延迟,**不省 token**(空转本来就不花)。它不是真相源:daemon 没起 / 状态过期、
+游标早于 `covered_from`、到定期校验时刻(`SLACK_WS_VERIFY`,默认 1800 秒)这三种情况都自动退回
+轮询,并在 log 里留一行原因。读取和判断在 `scripts/templates/_slack_ws.sh`,不开时完全不参与。
+
 `thread` 模式兼容两种 slackcli 命令形状,按顺序尝试、只有第一种失败才试第二种:
 
 ```text
