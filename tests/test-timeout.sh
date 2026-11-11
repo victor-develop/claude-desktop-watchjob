@@ -37,9 +37,10 @@ check "按时返回,没等子进程" '[ $((t1 - t0)) -le 4 ]'
 check "命令起的子进程也被杀掉" '! kill -0 "$child" 2>/dev/null'
 
 echo "== 看门狗不残留 =="
-run_with_timeout 7 true >/dev/null
+# 秒数取一个本机别的进程不会用的值,免得把无关的 sleep 当成残留
+run_with_timeout 4171 true >/dev/null
 sleep 0.5
-check "没有残留的 sleep 7" '! pgrep -f "^sleep 7$" >/dev/null'
+check "没有残留的看门狗 sleep" '! pgrep -f "^sleep 4171$" >/dev/null'
 
 echo
 echo "  通过 $PASS  失败 $FAIL"

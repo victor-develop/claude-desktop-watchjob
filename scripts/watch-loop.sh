@@ -20,6 +20,8 @@
 #                       落 <state>/relay-pending.json,每轮轮询时重投(间隔不短于 WATCH_RELAY_RETRY 秒,默认 60)。
 #                       terminal、max-runtime、致命错误这类退出前的通知会一直重投到成功才退出。
 #                       目标会话、唤醒链接等配置见 watch-relay.sh 顶部注释
+#   --relay-permission-mode M  投递进程的权限模式(写进 WATCH_RELAY_PERMISSION_MODE),默认 auto。
+#                       要和目标会话一致,不一致时通知会被 Desktop 挂起等人批准,而循环以为已送达
 #   --backoff           连续无事时间隔翻倍,上限 interval*8。适合低频源
 #   --active HH-HH      只在这个小时区间内轮询,窗口外空转(不算轮次),如 10-18
 #   --active-days D-D   只在这些星期内轮询(1=周一),如 1-5
@@ -66,6 +68,7 @@ while [ $# -gt 0 ]; do
     --backoff)     BACKOFF=1; shift ;;
     --daemon)      DAEMON=1; shift ;;
     --relay)       RELAY=1; DAEMON=1; shift ;;
+    --relay-permission-mode) export WATCH_RELAY_PERMISSION_MODE="$2"; shift 2 ;;
     --active)      ACTIVE_HOURS="$2"; shift 2 ;;
     --active-days) ACTIVE_DAYS="$2"; shift 2 ;;
     --seed)        SEED=1; shift ;;
