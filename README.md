@@ -121,8 +121,9 @@ A separate template for "everything addressed to me on Slack", as opposed to `pr
 polls one channel or thread for one task. It receives messages over Slack's RTM WebSocket through
 `slackcli messages listen` (pushed, a second or two after they are sent), backfills with
 `slackcli search messages` after reconnects, and filters
-locally: DMs, messages that mention you, mentions of a user group you belong to, and follow-ups in
-threads it already delivered. Bots on a skip list and your own messages are dropped; a message you
+locally: DMs, messages that mention you, mentions of a user group you belong to, follow-ups in
+threads it already delivered, and replies in threads on a hot-reloaded tracking list (each line
+`CHANNEL:THREAD_TS [local_<session id>]`, delivered without triage, optionally to a session of its own). Bots on a skip list and your own messages are dropped; a message you
 sent that mentions yourself is kept unless it carries the agent prefix (`AGENT_PREFIX`, default
 `[ 🐶 Claude:]`, same convention as the probe templates). What survives goes to a resident `claude -p` (haiku, no tools) for triage, and anything
 worth handling is delivered into a Claude Desktop session through `watch-relay.sh --note-file`.
@@ -266,7 +267,7 @@ judgment call.
 ./tests/test-ack.sh             # 21 assertions: watch-ack contract, lock takeover, no lost items when racing the loop
 ./tests/test-slack-modes.sh     # 51 assertions: the three Slack modes, thread-reply pickup, cursor, skipped unchanged threads
 ./tests/test-relay.sh           # 38 assertions: --relay delivery, queue and retry, delivery before exit, id lookup, wake via link, permission mode, --note-file
-./tests/test-slack-live.sh      # 44 assertions: slack-live filtering, triage skip rules and retry, backfill dedup and seen expiry, agent prefix, links, group cache, sender sanitizing, retry after restart
+./tests/test-slack-live.sh      # 64 assertions: slack-live filtering, triage skip rules and retry, backfill dedup and seen expiry, agent prefix, links, group cache, sender sanitizing, retry after restart, tracked threads
 ./tests/test-timeout.sh         #  6 assertions: run_with_timeout without timeout(1) kills the whole process group
 ```
 

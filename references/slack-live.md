@@ -1,24 +1,26 @@
 # Slack 实时监听模板(`scripts/slack-live/`)
 
 一个常驻脚本:通过 WebSocket 实时收 Slack 消息,在本地筛出「私聊我、@我、@我所在的组、我投递过的
-thread 里的后续消息」,剩下的用 haiku 初判,需要处理的投递进一个 Claude Desktop 会话,由那个会话读线程、
+thread 里的后续消息、跟踪名单里 thread 的回复」,剩下的用 haiku 初判,需要处理的投递进一个 Claude Desktop 会话,由那个会话读线程、
 分析、起草回复。监听和过滤不调用模型,只有过了过滤的消息才花一次初判。
 
 它和 `probe-slack.sh` 的分工:probe 是「定时拉一个频道或 thread,有新东西叫醒 agent」,适合盯一件具体
-的事;这个模板是「盯住所有找我的消息」,消息是推过来的,一两秒内收到。
+的事;这个模板是「盯住所有找我的消息」,消息是推过来的,一两秒内收到。要盯某条 thread 的回复时,
+它在跑就往跟踪名单里加一行(见下面「跟踪名单」),不用再给 thread 开轮询。
 
 ## 流程
 
 ```
 slackcli messages listen ── RTM WebSocket,每条 message 事件一行 JSON ──┐
 slackcli search messages 补拉(连上、重连时各一次,之后每 BACKFILL_SECONDS)┤
+slackcli conversations read 补拉跟踪的 thread(连上、重连时,之后每 TRACK_BACKFILL_SECONDS)┤
                                                             ▼
 slack-live.py
-  ├─ 本地过滤:私聊 / 正文含 <@我> / 含我所在用户组 / 投递过的 thread 后续
+  ├─ 本地过滤:跟踪名单里 thread 的回复 / 私聊 / 正文含 <@我> / 含我所在用户组 / 投递过的 thread 后续
   │           跳过:我自己的消息(@我自己的除外,带 AGENT_PREFIX 的照样跳过)、SKIP_SENDERS、
   │                 附件含 SKIP_ATTACHMENT_KEYWORDS、改消息删消息事件、启动前的历史消息
   ├─ 初判:常驻 `claude -p --tools ""`(stream-json),每条判完发 /clear
-  │        真人私聊、只有文件的消息、我 @ 自己的消息不判,直接投
+  │        跟踪的 thread、真人私聊、只有文件的消息、我 @ 自己的消息不判,直接投
   └─ 投递:scripts/watch-relay.sh --note-file
            投不出去进 state.json 的 pending,每 RELAY_RETRY_SECONDS 秒重投,重启后接着投
 ```
@@ -47,6 +49,35 @@ slack-live.py
 - **我在哪些组**:slackcli 的组列表不带成员,脚本逐个 `usergroups read`,组多时要几分钟(一百多个组约 7 分钟,
   这期间实时消息在管道里排队,不丢)。结果缓存在 `groups.json`,`GROUPS_REFRESH_SECONDS` 内重启不重查。
 - **常驻初判进程**:省掉每条几秒的冷启动。进程退出、超时或输出异常时杀掉,下一条再拉起。
+
+## 跟踪名单
+
+盯某条 thread 的回复(自己在 thread 里问了人、等对方答),往名单里加一行就行,脚本不用重启:
+
+```
+# ~/.claude/watch/slack-live/tracked/lead.txt
+C0123456789:1790000000.000100                                   # 投给默认会话(WATCH_TARGET_SESSION_LINK)
+https://acme.slack.com/archives/C0123456789/p1790000000000200   local_<会话 id>   # 投给这个会话
+D0123456789:1790000000.000300   claude://claude.ai/epitaxy/local_<会话 id>
+```
+
+- **放哪**:`TRACK_THREADS` 指向一个文件或一个目录,默认 `<SLACK_LIVE_STATE_DIR>/tracked`。目录下每个文件都读
+  (跳过 `.` 开头和 `~`、`.tmp`、`.swp` 结尾的),每个会话可以各管一个文件,互相不踩。
+- **每行**:`CHANNEL:THREAD_TS` 或 thread 的 Slack 链接(带 `thread_ts` 的回复链接也认),后面可选一个目标会话
+  (`local_<id>` 或会话链接)。`#` 后面是注释。看不懂的行跳过并写日志。同一个 thread 写了几行时,指定了会话的那行优先。
+- **怎么增删**:直接改文件。主循环每轮(最多 5 秒)看一眼文件的修改时间和大小,变了就重读。整个文件重写时用
+  「写临时文件再 mv」,免得读到写了一半的文件,把名单当成空的。
+- **从什么时候开始跟**:新加的 thread 从它所在文件的修改时间算起,更早的回复不投;记在 `state.json` 的
+  `tracked_since`,删掉那一行就清掉。所以要先加名单、再在 thread 里发问,或者两步挨着做。
+- **投什么**:名单里 thread 的回复,发送人不是我本人、不带 agent 前缀,就直接投递,不初判;机器人的回复也投
+  (`SKIP_SENDERS`、`SKIP_ATTACHMENT_KEYWORDS` 照样生效)。根消息本身不算。投递说明写「跟踪的 thread 有新回复」,
+  同时 @了我的标「(也 @了我)」,只投一次,按名单的目标投。
+- **投给谁**:行里写了会话就投给它(替换掉 `WATCH_TARGET_SESSION_LINK` / `_ID` / 标题,唤醒也按它);那个会话投不到
+  (归档了、唤醒后也收不到)就改投默认会话,说明里写明原定投给谁。
+- **补拉**:实时通道只收我在的频道的消息,断线期间的靠补拉:连上、重连时,以及每 `TRACK_BACKFILL_SECONDS` 秒,
+  逐个 `conversations read --thread-ts --oldest <开始跟的时间>`。每轮主循环只读 `TRACK_SCAN_BATCH` 个 thread,
+  名单长也不堵实时消息。
+- 名单里的 thread 一直跟,直到把那一行删掉。
 
 ## 前置依赖
 
@@ -92,6 +123,9 @@ slackcli messages listen --help       # 有输出就对了
 | `GROUPS_REFRESH_SECONDS` | `21600` | 多久重查一次我在哪些用户组 |
 | `SEEN_DAYS` | `14` | 去重记录多少天没再出现就淘汰 |
 | `TRIAGE_RETRY_SECONDS` | `120` | 初判失败后第一次重试的间隔,之后按次数翻倍 |
+| `TRACK_THREADS` | `<SLACK_LIVE_STATE_DIR>/tracked` | 跟踪名单,文件或目录,见「跟踪名单」 |
+| `TRACK_BACKFILL_SECONDS` | `1800` | 跟踪的 thread 多久补拉一遍(连上、重连时另外各一遍) |
+| `TRACK_SCAN_BATCH` | `5` | 补拉时每轮主循环读几个 thread |
 | `SLACK_LIVE_SLACKCLI` | `slackcli` | slackcli 命令,不在 PATH 上时给绝对路径 |
 
 ## 运行
@@ -113,7 +147,8 @@ tail -f ~/.claude/watch/slack-live/log
 
 - **权限模式不一致时投递会被挂起**,而 SendMessage 照样返回成功,脚本不重投。见 `references/mechanics.md`。
   `WATCH_RELAY_PERMISSION_MODE` 要手动和目标会话对齐;会话登记文件里没有权限模式字段,对不齐时脚本发现不了。
-- 群私聊(mpim)只有正文 @我 或 @我所在的组时才会收。
+- 群私聊(mpim)只有正文 @我 或 @我所在的组时才会收,除非那个 thread 在跟踪名单里。
+- 跟踪名单里的 thread 要在我加入的频道里,实时通道才收得到;不在的只能等补拉。
 - 只在 macOS 上实测过。
 - slackcli 的 `messages listen` 在上游合并前要用 fork 编的版本;`slackcli update` 会换回上游发布版,把它覆盖掉。
 

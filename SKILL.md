@@ -280,7 +280,9 @@ WATCH_TARGET_SESSION_LINK="claude://claude.ai/epitaxy/local_<会话 id>" \
   PR+Slack 合并 / HTTP JSON),配置走环境变量,直接可用。`_lib.sh` 里有 `require_env` 和 `run_with_timeout`
 - `scripts/slack-live/` —— Slack 实时监听模板:`slackcli messages listen` 收消息、本地过滤(私聊 / @我 / @我所在的组 / 投递过的
   thread 后续)、haiku 初判、经 `watch-relay.sh --note-file` 投递进一个会话。用户要「Slack 上找我的消息都实时
-  转给某个会话」时用它,而不是给每个频道开一个 watch。配置和前置依赖见 `references/slack-live.md`
+  转给某个会话」时用它,而不是给每个频道开一个 watch。它在跑时,要盯某条 Slack thread 的回复就往它的跟踪名单
+  (默认 `~/.claude/watch/slack-live/tracked/`,每行 `CHANNEL:THREAD_TS [local_<会话 id>]`)加一行,实时推送,
+  不用再给 thread 开轮询 watch。配置和前置依赖见 `references/slack-live.md`
 - `references/sources.md` —— 怎么挑模板、怎么自己写一个
 - `references/mechanics.md` —— 这个形状是怎么试出来的:实测过的平台行为、以及 cron 和
   scheduled-task 两条路为什么走不通。改动 `watch-loop.sh` 之前先读这个,免得重踩
