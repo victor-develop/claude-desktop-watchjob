@@ -608,6 +608,9 @@ def from_rtm(ev, me_id, groups, state):
     """RTM 事件转成和 search 结果同样的形状。只处理新消息,改消息、删消息之类的 subtype 不管。"""
     if ev.get("subtype") not in (None, "bot_message", "thread_broadcast", "file_share"):
         return None
+    if ev.get("is_ephemeral"):
+        # 只有我看得到的临时消息(比如 Slackbot 提示「被 @ 的人不在频道里」),不在频道历史里,不是别人的回复
+        return None
     channel_id = ev["channel"]
     msg = {k: ev[k] for k in ("ts", "thread_ts", "user", "username", "bot_id", "subtype", "text", "attachments", "files") if ev.get(k)}
     msg["channel"] = {"id": channel_id, "is_im": channel_id.startswith("D")}
@@ -765,10 +768,10 @@ class Tracker:
         return added
 
     def targets(self, msg, me_id):
-        """名单里 thread 的回复(不是根消息、不是我发的、在开始跟之后)返回目标会话 id 列表,空列表是默认会话;
+        """名单里 thread 的回复(不是根消息、不是我或 Slackbot 发的、在开始跟之后)返回目标会话 id 列表,空列表是默认会话;
         其他返回 None。"""
         thread_ts = thread_ts_of(msg)
-        if not thread_ts or thread_ts == msg.get("ts") or msg.get("user") == me_id:
+        if not thread_ts or thread_ts == msg.get("ts") or msg.get("user") in (me_id, "USLACKBOT"):
             return None
         key = thread_key(msg)
         if key not in self.threads or float(msg["ts"]) <= self.since.get(key, 0):
