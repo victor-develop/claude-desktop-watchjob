@@ -7,7 +7,7 @@
 # 覆盖:本地过滤(私聊 / @我 / @我所在的组 / 投递过的 thread 后续 / 自己 / 带 agent 前缀的自己 / 跳过名单 / 改消息)、
 #       真人私聊不初判、初判说不用就不投、投递内容不带原文、search 补拉和实时通道去重、
 #       投递失败排队并在下次启动时重投、启动时校验投递配置、跟踪名单(热加载、按 thread 指定会话、
-#       投不到改投默认会话、补拉、和 @我 不重复投)。
+#       几个会话登记同一 thread 各投一次、都投不到才改投默认会话、补拉、和 @我 不重复投)。
 
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -192,6 +192,7 @@ echo "== 跟踪名单 =="
 # 新的状态目录;名单是个目录,两个文件,一个写 CHANNEL:TS,一个写 Slack 链接和指定会话
 export SLACK_LIVE_STATE_DIR="$T/st2" THREADS_DIR="$T/threads" FAIL_TARGET="local_aaaaaaaa"
 SUB=local_11111111-2222-3333-4444-555555555555
+SUB2=local_22222222-2222-3333-4444-555555555555
 DEAD=local_aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee
 mkdir -p "$T/st2/tracked" "$T/threads"
 cat > "$T/st2/tracked/lead.txt" <<'EOF'
@@ -202,6 +203,15 @@ EOF
 cat > "$T/st2/tracked/sub.txt" <<EOF
 https://example.slack.com/archives/C8/p9000000200000100?thread_ts=9000000200.000100&cid=C8 $SUB
 D5:9000000300.000100 claude://claude.ai/epitaxy/$DEAD
+C6:9000000500.000100 $SUB
+C6:9000000600.000100 $SUB
+C6:9000000600.000100 $DEAD
+EOF
+# 同一个 thread 被另一个会话也登记了,还有一行重复登记同一个会话、一行没写会话
+cat > "$T/st2/tracked/sub2.txt" <<EOF
+C6:9000000500.000100 $SUB2
+C6:9000000500.000100 $SUB
+C6:9000000500.000100
 EOF
 # C7 这个 thread 从 .000060 开始跟:更早的回复不投
 echo '{"seen":{},"started_at":0,"tracked_since":{"C7:9000000100.000100":9000000100.000060}}' > "$T/st2/state.json"
@@ -225,9 +235,11 @@ EOF
   ev C8 9000000200.000101 UBOB "<@UME> NEED-YES 跟踪的 thread 里又 @我" '{"thread_ts":"9000000200.000100"}'
   ev D5 9000000300.000101 UBOB "私聊 thread 里的回复" '{"thread_ts":"9000000300.000100"}'
   ev C9 9000000400.000101 UBOB "NEED-YES 没跟踪的 thread" '{"thread_ts":"9000000400.000100"}'
+  ev C6 9000000500.000101 UBOB "两个会话都登记了的 thread" '{"thread_ts":"9000000500.000100"}'
+  ev C6 9000000600.000101 UBOB "一个会话投不到的 thread" '{"thread_ts":"9000000600.000100"}'
 } > "$T/events"
 rc=$(run)
-tgt() { awk -v ts="$1" '($1 "") == ts {print $2}' "$CALLS.targets"; }
+tgt() { awk -v ts="$1" '($1 "") == ts {print $2}' "$CALLS.targets" | sort | tr '\n' ' ' | sed 's/ $//'; }
 check "回放结束正常退出" '[ "$rc" = 0 ]'
 check "跟踪的 thread 里没 @我 的回复投给默认会话" '[ "$(delivered 9000000100.000101)" = 1 ] && [ "$(tgt 9000000100.000101)" = default ]'
 check "投递说明写明是跟踪的 thread 有新回复" 'grep -q "【Slack 触发】跟踪的 thread 有新回复 来自 bob (UBOB),channel C7,ts 9000000100.000101,thread_ts 9000000100.000100" "$CALLS"'
@@ -239,7 +251,9 @@ check "agent 前缀的回复不投" '[ "$(delivered 9000000100.000104)" = 0 ]'
 check "根消息本身不投" '[ -z "$(tgt 9000000100.000100)" ]'
 check "既 @我 又在名单里只投一次,投给指定的会话" '[ "$(delivered 9000000200.000101)" = 1 ] && [ "$(tgt 9000000200.000101)" = "claude://claude.ai/epitaxy/$SUB" ]'
 check "@了我的标出来" 'grep -q "跟踪的 thread 有新回复(也 @了我)" "$CALLS"'
-check "指定的会话投不到时改投默认会话,并说明原因" '[ "$(delivered 9000000300.000101)" = 1 ] && [ "$(tgt 9000000300.000101)" = default ] && grep -q "登记的是投给会话 $DEAD,那边投不到" "$CALLS"'
+check "指定的会话都投不到时改投默认会话,并说明原因" '[ "$(delivered 9000000300.000101)" = 1 ] && [ "$(tgt 9000000300.000101)" = default ] && grep -q "登记的是投给会话 $DEAD,那边都投不到" "$CALLS"'
+check "几个会话登记同一 thread:每个会话各投一次,同一会话只投一次,不投默认会话" '[ "$(tgt 9000000500.000101)" = "claude://claude.ai/epitaxy/$SUB claude://claude.ai/epitaxy/$SUB2" ]'
+check "其中一个会话投不到:只投到能投的那个,不改投默认会话" '[ "$(tgt 9000000600.000101)" = "claude://claude.ai/epitaxy/$SUB" ]'
 check "没跟踪的 thread 照旧不处理" '[ "$(delivered 9000000400.000101)" = 0 ] && [ "$(triaged "没跟踪的 thread")" = 0 ]'
 check "补拉读了跟踪的 thread,从开始跟的时间读起" 'grep -q -- "conversations read --json --thread-ts 9000000100.000100 --oldest 9000000100.0000[56]" "$SLACKCLI_LOG"'
 check "补拉到实时通道漏掉的回复,投一次" '[ "$(delivered 9000000100.000500)" = 1 ]'
@@ -263,10 +277,13 @@ with open(os.path.join(d, "a.txt"), "a") as f:
     f.write("C2:1790000000.000002 local_11111111-2222-3333-4444-555555555555\n")
 os.utime(os.path.join(d, "a.txt"), (time.time() + 5, time.time() + 5))
 assert t.reload(state) == ["C2:1790000000.000002"]
-assert t.threads["C2:1790000000.000002"] == "local_11111111-2222-3333-4444-555555555555"
+assert t.threads["C2:1790000000.000002"] == ["local_11111111-2222-3333-4444-555555555555"]
+assert t.threads["C1:1790000000.000001"] == []
 os.remove(os.path.join(d, "a.txt"))
 assert t.reload(state) == [] and t.threads == {} and state["tracked_since"] == {}
 assert live.parse_track_line("C1:1790000000.000001 local_bad") is None
+assert live.track_targets({"_track_target": "local_x"}) == ["local_x"], "旧版 pending 里的单个目标要认"
+assert live.track_targets({"_track_targets": []}) == []
 assert live.parse_track_line("http://x.slack.com/archives/C1/p1790000000000001") is None
 print("ok")
 EOF
