@@ -70,7 +70,7 @@ D0123456789:1790000000.000300   claude://claude.ai/epitaxy/local_<会话 id>
 - **从什么时候开始跟**:新加的 thread 从它所在文件的修改时间算起,更早的回复不投;记在 `state.json` 的
   `tracked_since`,删掉那一行就清掉。所以要先加名单、再在 thread 里发问,或者两步挨着做。
 - **投什么**:名单里 thread 的回复,发送人不是我本人、不带 agent 前缀,就直接投递,不初判;机器人的回复也投
-  (`SKIP_SENDERS`、`SKIP_ATTACHMENT_KEYWORDS` 照样生效)。根消息本身不算。投递说明写「跟踪的 thread 有新回复」,
+  (`SKIP_SENDERS`、`SKIP_ATTACHMENT_KEYWORDS` 照样生效)。根消息本身、Slackbot 发的、只有我看得到的临时消息(`is_ephemeral`,比如「被 @ 的人不在频道里」的提示)都不算。投递说明写「跟踪的 thread 有新回复」,
   同时 @了我的标「(也 @了我)」,只投一次,按名单的目标投。
 - **投给谁**:行里写了会话就投给它(替换掉 `WATCH_TARGET_SESSION_LINK` / `_ID` / 标题,唤醒也按它)。同一个 thread
   被几个会话登记(可以在不同文件里),每个会话各投一次,同一个会话只投一次;这时没写会话的行不起作用,只有全是
