@@ -749,7 +749,6 @@ class Tracker:
                     log(f"跟踪名单 {os.path.basename(f)} 第 {n} 行看不懂,跳过")
                     continue
                 key, target = parsed
-                # 同一个 thread 被几个会话登记时每个都投;只有没写会话的行时投默认会话
                 targets = threads.setdefault(key, [])
                 if target and target not in targets:
                     targets.append(target)
