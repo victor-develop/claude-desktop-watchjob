@@ -64,7 +64,7 @@ D0123456789:1790000000.000300   claude://claude.ai/epitaxy/local_<会话 id>
 - **放哪**:`TRACK_THREADS` 指向一个文件或一个目录,默认 `<SLACK_LIVE_STATE_DIR>/tracked`。目录下每个文件都读
   (跳过 `.` 开头和 `~`、`.tmp`、`.swp` 结尾的),每个会话可以各管一个文件,互相不踩。
 - **每行**:`CHANNEL:THREAD_TS` 或 thread 的 Slack 链接(带 `thread_ts` 的回复链接也认),后面可选一个目标会话
-  (`local_<id>` 或会话链接)。`#` 后面是注释。看不懂的行跳过并写日志。同一个 thread 写了几行时,指定了会话的那行优先。
+  (`local_<id>` 或会话链接)。`#` 后面是注释。看不懂的行跳过并写日志。
 - **怎么增删**:直接改文件。主循环每轮(最多 5 秒)看一眼文件的修改时间和大小,变了就重读。整个文件重写时用
   「写临时文件再 mv」,免得读到写了一半的文件,把名单当成空的。
 - **从什么时候开始跟**:新加的 thread 从它所在文件的修改时间算起,更早的回复不投;记在 `state.json` 的
@@ -72,8 +72,10 @@ D0123456789:1790000000.000300   claude://claude.ai/epitaxy/local_<会话 id>
 - **投什么**:名单里 thread 的回复,发送人不是我本人、不带 agent 前缀,就直接投递,不初判;机器人的回复也投
   (`SKIP_SENDERS`、`SKIP_ATTACHMENT_KEYWORDS` 照样生效)。根消息本身不算。投递说明写「跟踪的 thread 有新回复」,
   同时 @了我的标「(也 @了我)」,只投一次,按名单的目标投。
-- **投给谁**:行里写了会话就投给它(替换掉 `WATCH_TARGET_SESSION_LINK` / `_ID` / 标题,唤醒也按它);那个会话投不到
-  (归档了、唤醒后也收不到)就改投默认会话,说明里写明原定投给谁。
+- **投给谁**:行里写了会话就投给它(替换掉 `WATCH_TARGET_SESSION_LINK` / `_ID` / 标题,唤醒也按它)。同一个 thread
+  被几个会话登记(可以在不同文件里),每个会话各投一次,同一个会话只投一次;这时没写会话的行不起作用,只有全是
+  没写会话的行才投默认会话。登记的会话都投不到(归档了、唤醒后也收不到)才改投默认会话,说明里写明原定投给谁;
+  投到了其中一部分就算送达,投不到的那几个不重试。
 - **补拉**:实时通道只收我在的频道的消息,断线期间的靠补拉:连上、重连时,以及每 `TRACK_BACKFILL_SECONDS` 秒,
   逐个 `conversations read --thread-ts --oldest <开始跟的时间>`。每轮主循环只读 `TRACK_SCAN_BATCH` 个 thread,
   名单长也不堵实时消息。
@@ -81,9 +83,10 @@ D0123456789:1790000000.000300   claude://claude.ai/epitaxy/local_<会话 id>
 
 ## 前置依赖
 
-- **[slackcli](https://github.com/shaharia-lab/slackcli),而且要带 `messages listen` 子命令。** 这个子命令还没进上游
-  发布版(上游 issue [#527](https://github.com/shaharia-lab/slackcli/issues/527)),目前从
-  [victor-develop/slackcli](https://github.com/victor-develop/slackcli) 的 `feat/listen-rtm` 分支编:
+- **带 `messages listen` 子命令的 slackcli,也就是 fork 版。** 上游 [shaharia-lab/slackcli](https://github.com/shaharia-lab/slackcli)
+  不会加这个子命令:提议的 issue [#527](https://github.com/shaharia-lab/slackcli/issues/527) 2026-11-19 以 not planned
+  关掉了,理由是 RTM 已废弃、新建的 Slack app 用不了,实际只有浏览器登录态能连。所以要长期用
+  [victor-develop/slackcli](https://github.com/victor-develop/slackcli) 的 `feat/listen-rtm` 分支编出来的版本:
 
 ```bash
 git clone -b feat/listen-rtm https://github.com/victor-develop/slackcli && cd slackcli
@@ -150,7 +153,9 @@ tail -f ~/.claude/watch/slack-live/log
 - 群私聊(mpim)只有正文 @我 或 @我所在的组时才会收,除非那个 thread 在跟踪名单里。
 - 跟踪名单里的 thread 要在我加入的频道里,实时通道才收得到;不在的只能等补拉。
 - 只在 macOS 上实测过。
-- slackcli 的 `messages listen` 在上游合并前要用 fork 编的版本;`slackcli update` 会换回上游发布版,把它覆盖掉。
+- `messages listen` 只在 fork 版里有,上游不会合。**别跑 `slackcli update`**:它会装上游发布版,把 fork 版覆盖掉,
+  实时通道就断了(脚本会告警,只剩补拉)。要更新就在 fork 的 `feat/listen-rtm` 分支上合上游再重编。
+- RTM 是 Slack 已废弃的接口,只有浏览器登录态(xoxc + d cookie)连得上;哪天 Slack 关掉它,实时通道就没了。
 
 ## 测试
 

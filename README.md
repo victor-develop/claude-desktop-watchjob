@@ -133,9 +133,10 @@ not instructions), never the message text.
 All personal settings are environment variables (target session, permission mode, skip lists,
 agent prefix, state directory). Slack access goes through
 [slackcli](https://github.com/shaharia-lab/slackcli), using only a fixed set of read-only
-subcommands; tokens stay in slackcli's own credential store. `messages listen` is not in an
-upstream release yet, so for now build slackcli from the `feat/listen-rtm` branch of
-[victor-develop/slackcli](https://github.com/victor-develop/slackcli). Setup, configuration and limits are in
+subcommands; tokens stay in slackcli's own credential store. `messages listen` only exists in the
+`feat/listen-rtm` branch of the fork [victor-develop/slackcli](https://github.com/victor-develop/slackcli):
+upstream declined it ([#527](https://github.com/shaharia-lab/slackcli/issues/527), not planned, because RTM is
+deprecated), so build slackcli from that branch and don't run `slackcli update`, which would replace it. Setup, configuration and limits are in
 [`references/slack-live.md`](references/slack-live.md).
 
 ## Usage

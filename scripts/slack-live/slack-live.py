@@ -406,7 +406,7 @@ def is_bot(msg):
     return bool(msg.get("bot_id")) or msg.get("subtype") == "bot_message" or msg.get("user") == "USLACKBOT"
 
 
-def build_note(msg, reason, fallback_from=""):
+def build_note(msg, reason, fallback_from=()):
     sender = sender_label(msg)
     channel_id = (msg.get("channel") or {}).get("id", "")
     if msg.get("_tracked"):
@@ -416,7 +416,7 @@ def build_note(msg, reason, fallback_from=""):
             f"【Slack 触发】{describe(msg)} 来自 {sender},channel {channel_id},ts {msg.get('ts', '')},"
             f"thread_ts {thread_ts_of(msg)}\n"
             f"链接:{msg.get('permalink', '')}"
-            + (f"\n这个 thread 登记的是投给会话 {fallback_from},那边投不到,先转给你" if fallback_from else "")
+            + (f"\n这个 thread 登记的是投给会话 {'、'.join(fallback_from)},那边都投不到,先转给你" if fallback_from else "")
         )
     return (
         "这是用户本人的 Slack 监听转来的消息,用户要你替他处理:先用 Slack 工具读原文和完整线程,"
@@ -427,16 +427,31 @@ def build_note(msg, reason, fallback_from=""):
     )
 
 
+def track_targets(msg):
+    targets = msg.get("_track_targets")
+    if targets is None:
+        # 旧版 state.json 的 pending 里存的是单个 _track_target
+        targets = [msg["_track_target"]] if msg.get("_track_target") else []
+    return targets
+
+
 def relay(msg, reason):
-    """跟踪名单给这个 thread 指定了会话时投给它;投不到(会话归档了、起不来)就改投默认会话,不让消息卡在 pending 里。"""
-    target = msg.get("_track_target") or ""
-    if not target:
+    """跟踪名单给这个 thread 指定了会话时,每个会话各投一次;一个都投不到(归档了、起不来)才改投默认会话,
+    不让消息卡在 pending 里。投到了一部分就算成功,投不到的那几个不重试。"""
+    targets = track_targets(msg)
+    if not targets:
         return relay_note(build_note(msg, reason))
-    try:
-        return relay_note(build_note(msg, reason), target)
-    except Exception as e:
-        log(f"投给跟踪名单指定的会话 {target} 失败,改投默认会话 {msg.get('ts')}: {e}")
-        return relay_note(build_note(msg, reason, fallback_from=target))
+    done, failed = [], []
+    for target in targets:
+        try:
+            done.append(relay_note(build_note(msg, reason), target))
+        except Exception as e:
+            log(f"投给跟踪名单指定的会话 {target} 失败 {msg.get('ts')}: {e}")
+            failed.append(target)
+    if done:
+        return "; ".join(done)
+    log(f"跟踪名单指定的会话都投不到,改投默认会话 {msg.get('ts')}")
+    return relay_note(build_note(msg, reason, fallback_from=failed))
 
 
 def relay_note(note, target=""):
@@ -481,7 +496,7 @@ def handle(msg, me_id, state):
     except Exception as e:
         log(f"投递失败,排队等待重试 {msg['ts']}: {e}")
         keep = ("ts", "thread_ts", "user", "username", "permalink", "_group", "_direct", "_followup", "_self",
-                "_tracked", "_track_target")
+                "_tracked", "_track_targets")
         slim = {k: msg[k] for k in keep if k in msg}
         slim["channel"] = {k: v for k, v in (msg.get("channel") or {}).items() if k in ("id", "is_im")}
         state.setdefault("pending", []).append({"msg": slim, "reason": reason, "next_at": time.time() + RELAY_RETRY_SECONDS})
@@ -529,9 +544,9 @@ def screen(msg, me_id, groups, started_at, threads=None):
         log(f"跳过 {ts},附件含 {hit_keyword}")
         return False
     msg["_direct"] = f"<@{me_id}>" in text
-    target = TRACKER.target(msg, me_id)
-    if target is not None:
-        msg["_tracked"], msg["_track_target"] = True, target
+    targets = TRACKER.targets(msg, me_id)
+    if targets is not None:
+        msg["_tracked"], msg["_track_targets"] = True, targets
     elif not is_dm(msg) and not msg["_direct"]:
         hit = [h for gid, h in groups.items() if f"<@{gid}>" in text or f"<!subteam^{gid}" in text]
         if hit:
@@ -691,7 +706,7 @@ def parse_track_line(line):
 
 
 class Tracker:
-    """跟踪名单 {channel:thread_ts: 目标会话 id,"" 是默认会话}。主循环每轮看一眼文件的 mtime,变了就重读。
+    """跟踪名单 {channel:thread_ts: [目标会话 id],空列表是默认会话}。主循环每轮看一眼文件的 mtime,变了就重读。
     since 记每个 thread 从什么时候开始跟(存在 state.json 的 tracked_since),更早的回复不投。"""
 
     def __init__(self, path):
@@ -734,9 +749,9 @@ class Tracker:
                     log(f"跟踪名单 {os.path.basename(f)} 第 {n} 行看不懂,跳过")
                     continue
                 key, target = parsed
-                # 同一个 thread 写了几行时,指定了会话的那行优先
-                if target or key not in threads:
-                    threads[key] = target
+                targets = threads.setdefault(key, [])
+                if target and target not in targets:
+                    targets.append(target)
                 first_at.setdefault(key, mtime)
         since = state.setdefault("tracked_since", {})
         added = [k for k in threads if k not in since]
@@ -749,8 +764,9 @@ class Tracker:
         log(f"跟踪名单 {len(threads)} 个 thread(新加 {len(added)},去掉 {len(removed)})")
         return added
 
-    def target(self, msg, me_id):
-        """名单里 thread 的回复(不是根消息、不是我发的、在开始跟之后)返回目标会话 id;其他返回 None。"""
+    def targets(self, msg, me_id):
+        """名单里 thread 的回复(不是根消息、不是我发的、在开始跟之后)返回目标会话 id 列表,空列表是默认会话;
+        其他返回 None。"""
         thread_ts = thread_ts_of(msg)
         if not thread_ts or thread_ts == msg.get("ts") or msg.get("user") == me_id:
             return None
