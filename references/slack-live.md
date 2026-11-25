@@ -23,6 +23,8 @@ slack-live.py
   │        跟踪的 thread、真人私聊、只有文件的消息、我 @ 自己的消息不判,直接投
   └─ 投递:scripts/watch-relay.sh --note-file
            投不出去进 state.json 的 pending,每 RELAY_RETRY_SECONDS 秒重投,重启后接着投
+  └─ 催办:投出去的记进 deliveries.json;会话用 slack-live-ack 标已处理,没标的按时提醒,
+           提醒够次数改投默认会话
 ```
 
 - **实时通道和补拉按 ts 去重**,同一条只处理一次。seen 记的是每个 ts 最近一次出现的时间,补拉又搜到就续期,
@@ -81,6 +83,29 @@ D0123456789:1790000000.000300   claude://claude.ai/epitaxy/local_<会话 id>
   名单长也不堵实时消息。
 - 名单里的 thread 一直跟,直到把那一行删掉。
 
+## 已处理确认
+
+每投出去一条(私聊、@、组、thread 后续、跟踪的 thread 回复都算;被过滤、初判说不用的不算),就在
+`<SLACK_LIVE_STATE_DIR>/deliveries.json` 记一份:channel、ts、thread_ts、类型、发送人、链接、投给哪个会话、
+投递时间、状态。一条消息投给几个会话就记几份。投递说明末尾带上标已处理的命令。
+
+```bash
+S=~/.claude/skills/incremental-watch/scripts/slack-live
+$S/slack-live-ack C0123456789:1790000000.000100            # 标一条(也可以贴消息的 Slack 链接,可以一次给多个)
+$S/slack-live-ack --thread C0123456789:1790000000.000100   # 标这个 thread 里投过的所有消息
+$S/slack-live-ack --session local_<id> <CHANNEL:TS>        # 只标投给这个会话的那份
+$S/slack-live-ack --list [--session local_<id>]            # 看还有哪些没标
+```
+
+- 不给 `--session` 时,这条消息投给所有会话的那几份一起标掉。没找到投过的这条时退出 1。
+- 投出去 `ACK_FIRST_REMIND_SECONDS`(默认 180)秒还没标,再投一次给原会话,说明里写「N 分钟前投给过你,
+  还没标已处理(第几次提醒)」;之后每 `ACK_REMIND_SECONDS`(默认 600)秒一次。提醒满 `ACK_MAX_REMINDS`
+  (默认 6)次还没标,改投默认会话一次,写明原本投给谁,之后不再催;原本就投给默认会话的,提醒满了就停。
+- 检查在主循环里做,每 `ACK_CHECK_SECONDS`(默认 60)秒一次,不另起进程:slack-live 在跑提醒就在跑。
+  提醒投不出去时 `ACK_CHECK_SECONDS` 秒后再试,不算次数。
+- `deliveries.json` 由 slack-live 和 slack-live-ack 两边改,读改写都在文件锁(`deliveries.json.lock`)里。
+  标过的和不再催的记录 7 天后清掉。`ACK_MAX_REMINDS=0` 关掉提醒,只记录。
+
 ## 前置依赖
 
 - **带 `messages listen` 子命令的 slackcli,也就是 fork 版。** 上游 [shaharia-lab/slackcli](https://github.com/shaharia-lab/slackcli)
@@ -129,6 +154,10 @@ slackcli messages listen --help       # 有输出就对了
 | `TRACK_THREADS` | `<SLACK_LIVE_STATE_DIR>/tracked` | 跟踪名单,文件或目录,见「跟踪名单」 |
 | `TRACK_BACKFILL_SECONDS` | `1800` | 跟踪的 thread 多久补拉一遍(连上、重连时另外各一遍) |
 | `TRACK_SCAN_BATCH` | `5` | 补拉时每轮主循环读几个 thread |
+| `ACK_FIRST_REMIND_SECONDS` | `180` | 投出去多久还没标已处理就第一次提醒 |
+| `ACK_REMIND_SECONDS` | `600` | 之后隔多久再提醒 |
+| `ACK_MAX_REMINDS` | `6` | 最多提醒几次,满了改投默认会话;`0` 不提醒 |
+| `ACK_CHECK_SECONDS` | `60` | 多久检查一次没标的 |
 | `SLACK_LIVE_SLACKCLI` | `slackcli` | slackcli 命令,不在 PATH 上时给绝对路径 |
 
 ## 运行

@@ -7,7 +7,8 @@
 # 覆盖:本地过滤(私聊 / @我 / @我所在的组 / 投递过的 thread 后续 / 自己 / 带 agent 前缀的自己 / 跳过名单 / 改消息)、
 #       真人私聊不初判、初判说不用就不投、投递内容不带原文、search 补拉和实时通道去重、
 #       投递失败排队并在下次启动时重投、启动时校验投递配置、跟踪名单(热加载、按 thread 指定会话、
-#       几个会话登记同一 thread 各投一次、都投不到才改投默认会话、补拉、和 @我 不重复投)。
+#       几个会话登记同一 thread 各投一次、都投不到才改投默认会话、补拉、和 @我 不重复投)、
+#       已处理确认(投递记录、slack-live-ack、没标的按次数提醒、提醒满了改投默认会话)。
 
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -295,6 +296,38 @@ EOF
 out=$(SLACK_LIVE_STATE_DIR="$T/st3" python3 "$T/reload.py" "$LIVE" "$T/st3/tracked" 2>&1 | tail -1)
 check "名单热加载:增删都生效,没变不重读,会话 id 不合法的行不认" '[ "$out" = ok ]'
 unset FAIL_TARGET THREADS_DIR
+
+echo "== 已处理确认 =="
+ACK="$PWD/scripts/slack-live/slack-live-ack"
+export SLACK_LIVE_STATE_DIR="$T/st4" THREADS_DIR="$T/threads-empty" ACK_FIRST_REMIND_SECONDS=0 ACK_REMIND_SECONDS=0 ACK_MAX_REMINDS=2
+mkdir -p "$T/st4/tracked"
+echo "C6:9000000700.000100 $SUB" > "$T/st4/tracked/sub.txt"
+echo '{"seen":{},"started_at":0}' > "$T/st4/state.json"
+: > "$CALLS"; : > "$CALLS.targets"
+{
+  echo '{"type":"hello"}'
+  ev D1 9000000700.000001 UBOB "要确认的私聊"
+  ev C6 9000000700.000101 UBOB "跟踪 thread 里要确认的回复" '{"thread_ts":"9000000700.000100"}'
+} > "$T/events"
+run >/dev/null
+n_of() { awk -v ts="$1" '($1 "") == ts' "$CALLS.targets" | wc -l | tr -d ' '; }
+check "投递说明附上标已处理的命令" 'grep -q "处理完(判断不用处理也算)运行:$ACK D1:9000000700.000001" "$CALLS"'
+check "投出去的记进 deliveries.json,状态待处理" '[ "$(jq -r ".[\"D1:9000000700.000001|\"].status" "$T/st4/deliveries.json")" = pending ] && [ "$(jq -r ".[\"C6:9000000700.000101|$SUB\"].thread_ts" "$T/st4/deliveries.json")" = 9000000700.000100 ]'
+check "到时间还没标:给原会话发第 1 次提醒" '[ "$(n_of 9000000700.000001)" = 2 ] && [ "$(tgt 9000000700.000101)" = "claude://claude.ai/epitaxy/$SUB claude://claude.ai/epitaxy/$SUB" ] && grep -q "还没标已处理(第 1 次提醒)" "$CALLS"'
+out=$("$ACK" --list); check "--list 列出两条待处理" '[ "$(printf "%s\n" "$out" | grep -c .)" = 2 ]'
+"$ACK" D1:9000000700.000001 >/dev/null; rc=$?
+check "slack-live-ack 标掉一条" '[ "$rc" = 0 ] && [ "$(jq -r ".[\"D1:9000000700.000001|\"].status" "$T/st4/deliveries.json")" = done ]'
+"$ACK" D1:9000000799.000001 >/dev/null 2>&1; rc=$?
+check "标一条没投过的,退出 1" '[ "$rc" = 1 ]'
+: > "$T/events"; run >/dev/null
+check "标掉的不再提醒,没标的提醒第 2 次" '[ "$(n_of 9000000700.000001)" = 2 ] && [ "$(n_of 9000000700.000101)" = 3 ]'
+run >/dev/null
+check "提醒满了还没标:改投默认会话并说明" '[ "$(n_of 9000000700.000101)" = 4 ] && [ "$(awk "\$1==\"9000000700.000101\"" "$CALLS.targets" | tail -1 | cut -d" " -f2)" = default ] && grep -q "提醒了 2 次还没标已处理,转给你" "$CALLS" && [ "$(jq -r ".[\"C6:9000000700.000101|$SUB\"].status" "$T/st4/deliveries.json")" = escalated ]'
+run >/dev/null
+check "改投之后不再催" '[ "$(n_of 9000000700.000101)" = 4 ]'
+"$ACK" --thread "https://example.slack.com/archives/C6/p9000000700000101?thread_ts=9000000700.000100&cid=C6" >/dev/null; rc=$?
+check "--thread 用链接标掉整个 thread" '[ "$rc" = 0 ] && [ "$(jq -r ".[\"C6:9000000700.000101|$SUB\"].status" "$T/st4/deliveries.json")" = done ] && [ -z "$("$ACK" --list)" ]'
+unset ACK_FIRST_REMIND_SECONDS ACK_REMIND_SECONDS ACK_MAX_REMINDS THREADS_DIR
 export SLACK_LIVE_STATE_DIR="$T/st"
 
 echo "== 启动校验 =="

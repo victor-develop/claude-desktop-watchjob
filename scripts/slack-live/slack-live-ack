@@ -1,0 +1,3 @@
+#!/bin/bash
+# 把 slack-live 投过来的消息标成已处理。用法见 slack-live-ack --help
+exec python3 "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/slack-live.py" ack "$@"
