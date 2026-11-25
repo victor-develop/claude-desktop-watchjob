@@ -10,6 +10,8 @@
     真人私聊、只有文件的消息、@我自己的消息不判,直接投递。
 投:scripts/watch-relay.sh --note-file 投递,和 incremental-watch 的 --relay 共用收件地址解析、
     唤醒和权限模式。投不出去的进 state.json 的 pending,每 RELAY_RETRY_SECONDS 秒重投。
+催:投出去的每条记进 deliveries.json,会话处理完用 slack-live-ack 标掉;过一会儿还没标的再投一次提醒,
+    提醒够次数还没标就改投默认会话。
 
 投递内容由本脚本按模板拼:类型、发送人、channel、ts、链接和初判理由,不带消息原文,
 消息里夹带的指令到不了目标会话;会话自己用 Slack 工具去读原文。
@@ -20,6 +22,8 @@ token 和 cookie 留在 slackcli 自己的凭据存储里,本进程拿不到。
 配置全部走环境变量,见 references/slack-live.md。
 """
 
+import contextlib
+import fcntl
 import json
 import os
 import queue
@@ -74,6 +78,14 @@ TRACK_THREADS = os.path.expanduser(os.environ.get("TRACK_THREADS", os.path.join(
 TRACK_BACKFILL_SECONDS = int(os.environ.get("TRACK_BACKFILL_SECONDS", "1800"))
 TRACK_SCAN_BATCH = int(os.environ.get("TRACK_SCAN_BATCH", "5"))
 SESSION_ID_RE = re.compile(r"local_[0-9a-fA-F-]{8,64}")
+DELIVERIES_FILE = os.path.join(STATE_DIR, "deliveries.json")
+ACK_CMD = os.path.join(HERE, "slack-live-ack")
+# 投出去多久还没标处理就第一次提醒,之后隔多久再提醒,最多提醒几次(0 = 不提醒)后改投默认会话
+ACK_FIRST_REMIND_SECONDS = int(os.environ.get("ACK_FIRST_REMIND_SECONDS", "180"))
+ACK_REMIND_SECONDS = int(os.environ.get("ACK_REMIND_SECONDS", "600"))
+ACK_MAX_REMINDS = int(os.environ.get("ACK_MAX_REMINDS", "6"))
+ACK_CHECK_SECONDS = int(os.environ.get("ACK_CHECK_SECONDS", "60"))
+ACK_KEEP_DAYS = 7
 THREAD_TS_RE = re.compile(r"\d{9,10}\.\d{6}")
 
 
@@ -440,18 +452,172 @@ def relay(msg, reason):
     不让消息卡在 pending 里。投到了一部分就算成功,投不到的那几个不重试。"""
     targets = track_targets(msg)
     if not targets:
-        return relay_note(build_note(msg, reason))
+        return deliver(msg, build_note(msg, reason), "")
     done, failed = [], []
     for target in targets:
         try:
-            done.append(relay_note(build_note(msg, reason), target))
+            done.append(deliver(msg, build_note(msg, reason), target))
         except Exception as e:
             log(f"投给跟踪名单指定的会话 {target} 失败 {msg.get('ts')}: {e}")
             failed.append(target)
     if done:
         return "; ".join(done)
     log(f"跟踪名单指定的会话都投不到,改投默认会话 {msg.get('ts')}")
-    return relay_note(build_note(msg, reason, fallback_from=failed))
+    return deliver(msg, build_note(msg, reason, fallback_from=failed), "")
+
+
+def deliver(msg, note, target):
+    """投一条消息,说明末尾附上标已处理的命令;投到了记进 deliveries.json。"""
+    channel_id = (msg.get("channel") or {}).get("id", "")
+    out = relay_note(f"{note}\n处理完(判断不用处理也算)运行:{ACK_CMD} {channel_id}:{msg.get('ts', '')}", target)
+    try:
+        record_delivery(msg, target)
+    except Exception as e:
+        log(f"记投递记录失败 {msg.get('ts')}: {e}")
+    return out
+
+
+@contextlib.contextmanager
+def deliveries():
+    """投递记录 {"<channel>:<ts>|<会话 id>": 记录},默认会话的 id 是空串。slack-live 和 slack-live-ack 两个进程
+    都会改,读改写都在文件锁里;块里抛异常时不写回。"""
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(DELIVERIES_FILE + ".lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            with open(DELIVERIES_FILE) as f:
+                data = json.load(f)
+        except (FileNotFoundError, ValueError):
+            data = {}
+        yield data
+        tmp = DELIVERIES_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(data, f, ensure_ascii=False, indent=1)
+        os.replace(tmp, DELIVERIES_FILE)
+
+
+def record_delivery(msg, target):
+    channel_id = (msg.get("channel") or {}).get("id", "")
+    thread_ts = thread_ts_of(msg)
+    now = time.time()
+    with deliveries() as data:
+        data[f"{channel_id}:{msg['ts']}|{target}"] = {
+            "channel": channel_id, "ts": msg["ts"], "thread_ts": thread_ts if thread_ts != msg["ts"] else "",
+            "kind": describe(msg), "sender": sender_label(msg), "link": msg.get("permalink", ""),
+            "target": target, "delivered_at": now, "status": "pending", "reminders": 0,
+            "next_remind_at": now + ACK_FIRST_REMIND_SECONDS,
+        }
+
+
+def reminder_note(d, escalate_from=""):
+    mins = int((time.time() - d["delivered_at"]) // 60)
+    where = f"channel {d['channel']},ts {d['ts']}" + (f",thread_ts {d['thread_ts']}" if d.get("thread_ts") else "")
+    if escalate_from:
+        head = (f"这是用户本人的 Slack 监听发的提醒:下面这条 {mins} 分钟前投给了会话 {escalate_from},"
+                f"提醒了 {d['reminders']} 次还没标已处理,转给你。先用 Slack 工具读原文和完整线程,看要不要跟进。")
+    else:
+        head = (f"这是用户本人的 Slack 监听发的提醒:下面这条 {mins} 分钟前投给过你,还没标已处理"
+                f"(第 {d['reminders'] + 1} 次提醒)。处理了就标掉,判断不用处理也要标掉。")
+    return (f"{head}\n【Slack 触发】{d['kind']} 来自 {d['sender']},{where}\n链接:{d['link']}\n"
+            f"标已处理:{ACK_CMD} {d['channel']}:{d['ts']}")
+
+
+def remind_unacked():
+    """投出去超过 ACK_FIRST_REMIND_SECONDS 秒还没标处理的,再投一次给原会话,之后每 ACK_REMIND_SECONDS 秒一次;
+    提醒满 ACK_MAX_REMINDS 次还没标,改投默认会话(原本就是默认会话的就不再提醒),之后不再催。"""
+    if ACK_MAX_REMINDS <= 0:
+        return
+    now = time.time()
+    with deliveries() as data:
+        for key in [k for k, d in data.items()
+                    if d.get("status") != "pending" and now - d.get("delivered_at", 0) > ACK_KEEP_DAYS * 86400]:
+            del data[key]
+        due = [(k, dict(d)) for k, d in data.items() if d.get("status") == "pending" and d.get("next_remind_at", 0) <= now]
+    # 投递一次要几秒到几十秒,不拿着锁投,免得 slack-live-ack 卡住
+    for key, d in due:
+        target = d.get("target", "")
+        escalate = d["reminders"] >= ACK_MAX_REMINDS
+        if escalate and not target:
+            update = {"status": "given_up"}
+            log(f"提醒 {d['reminders']} 次还没标处理,不再提醒 {key}")
+        else:
+            try:
+                if escalate:
+                    relay_note(reminder_note(d, escalate_from=target), "")
+                    update = {"status": "escalated"}
+                    log(f"提醒 {d['reminders']} 次还没标处理,已改投默认会话 {key}")
+                else:
+                    relay_note(reminder_note(d), target)
+                    update = {"reminders": d["reminders"] + 1, "next_remind_at": time.time() + ACK_REMIND_SECONDS}
+                    log(f"已提醒第 {d['reminders'] + 1} 次 {key}")
+            except Exception as e:
+                update = {"next_remind_at": time.time() + ACK_CHECK_SECONDS}
+                log(f"提醒投递失败,{ACK_CHECK_SECONDS} 秒后再试 {key}: {e}")
+        with deliveries() as data:
+            if data.get(key, {}).get("status") == "pending":
+                data[key].update(update)
+
+
+def parse_ref(spec, thread=False):
+    """`CHANNEL:TS` 或消息的 Slack 链接,返回 (channel, ts);thread=True 时链接取它的 thread_ts。看不懂返回 None。"""
+    m = re.fullmatch(r"([CDG][A-Z0-9]+):(\d{9,10}\.\d{6})", spec)
+    if m:
+        return m[1], m[2]
+    u = urllib.parse.urlparse(spec)
+    m = re.fullmatch(r"/archives/([CDG][A-Z0-9]+)/p(\d{10})(\d{6})", u.path)
+    if u.scheme != "https" or not m:
+        return None
+    ts = f"{m[2]}.{m[3]}"
+    if thread:
+        ts = urllib.parse.parse_qs(u.query).get("thread_ts", [ts])[0]
+    return (m[1], ts) if THREAD_TS_RE.fullmatch(ts) else None
+
+
+def ack_main(argv):
+    import argparse
+    ap = argparse.ArgumentParser(prog="slack-live-ack", description="把 slack-live 投过来的消息标成已处理,标了就不再提醒。")
+    ap.add_argument("refs", nargs="*", help="CHANNEL:TS 或消息的 Slack 链接,可以给多个")
+    ap.add_argument("--thread", action="store_true", help="refs 当成 thread:标这个 thread 里投过的所有消息")
+    ap.add_argument("--session", help="只标投给这个会话(local_<id>)的那份;不给就标所有会话的")
+    ap.add_argument("--list", action="store_true", help="列出还没标处理的")
+    args = ap.parse_args(argv)
+    if args.session and not SESSION_ID_RE.fullmatch(args.session.rsplit("/", 1)[-1]):
+        print(f"--session 不是会话 id: {args.session}", file=sys.stderr)
+        return 2
+    session = args.session.rsplit("/", 1)[-1] if args.session else None
+    if args.list:
+        with deliveries() as data:
+            rows = sorted((d for d in data.values() if d.get("status") == "pending"
+                           and (session is None or d.get("target") == session)), key=lambda d: d["delivered_at"])
+        for d in rows:
+            mins = int((time.time() - d["delivered_at"]) // 60)
+            print(f"{d['channel']}:{d['ts']}  {d['kind']}  投给 {d.get('target') or '默认会话'}  "
+                  f"{mins} 分钟前  已提醒 {d['reminders']} 次  {d['link']}")
+        return 0
+    if not args.refs:
+        ap.error("要给 CHANNEL:TS,或者用 --list")
+    refs = []
+    for spec in args.refs:
+        ref = parse_ref(spec, args.thread)
+        if not ref:
+            print(f"看不懂: {spec}(要 CHANNEL:TS 或 Slack 链接)", file=sys.stderr)
+            return 2
+        refs.append(ref)
+    missing = 0
+    with deliveries() as data:
+        for channel, ts in refs:
+            hits = [d for d in data.values() if d.get("channel") == channel
+                    and (d.get("ts") == ts or (args.thread and d.get("thread_ts") == ts))
+                    and (session is None or d.get("target") == session)]
+            for d in hits:
+                if d.get("status") != "done":
+                    d.update(status="done", acked_at=time.time())
+            if hits:
+                print(f"已标处理 {channel}:{ts}({len(hits)} 份)")
+            else:
+                missing += 1
+                print(f"没找到 slack-live 投过的 {channel}:{ts}", file=sys.stderr)
+    return 1 if missing else 0
 
 
 def relay_note(note, target=""):
@@ -828,6 +994,8 @@ def start_listener():
 
 
 def main():
+    if sys.argv[1:2] == ["ack"]:
+        sys.exit(ack_main(sys.argv[2:]))
     # --exit-on-eof:事件流读完就退出,不重启 messages listen。用来回放一段录下来的事件,也是测试的入口
     exit_on_eof = "--exit-on-eof" in sys.argv[1:]
     os.makedirs(STATE_DIR, exist_ok=True)
@@ -885,6 +1053,7 @@ def run(me_id, queries, exit_on_eof, listener):
     listener_started, restart_wait, alerted = time.time(), 5, False
     backfill_due = time.time() + BACKFILL_SECONDS
     track_due, track_queue = time.time() + TRACK_BACKFILL_SECONDS, []
+    ack_due = time.time() + ACK_CHECK_SECONDS
     streams_open = 2
     while True:
         try:
@@ -915,6 +1084,7 @@ def run(me_id, queries, exit_on_eof, listener):
                     scan_tracked(track_queue, me_id, state, groups)
                     flush_retries(me_id, state)
                     flush_pending(state)
+                    remind_unacked()
                     log("事件流读完,退出")
                     return
                 # 网络断线 listen 自己会重连;它退出多半是登录态失效,很快又退出时拉长间隔,别刷屏
@@ -953,6 +1123,12 @@ def run(me_id, queries, exit_on_eof, listener):
             flush_pending(state)
         except Exception as e:
             log(f"重试或重投出错: {e}")
+        if time.time() >= ack_due:
+            try:
+                remind_unacked()
+            except Exception as e:
+                log(f"检查未处理的投递出错: {e}")
+            ack_due = time.time() + ACK_CHECK_SECONDS
         if track_queue:
             batch, track_queue = track_queue[:TRACK_SCAN_BATCH], track_queue[TRACK_SCAN_BATCH:]
             try:
