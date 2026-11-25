@@ -6,7 +6,8 @@
 #
 # 覆盖:本地过滤(私聊 / @我 / @我所在的组 / 投递过的 thread 后续 / 自己 / 带 agent 前缀的自己 / 跳过名单 / 改消息)、
 #       真人私聊不初判、初判说不用就不投、投递内容不带原文、search 补拉和实时通道去重、
-#       投递失败排队并在下次启动时重投、启动时校验投递配置。
+#       投递失败排队并在下次启动时重投、启动时校验投递配置、跟踪名单(热加载、按 thread 指定会话、
+#       投不到改投默认会话、补拉、和 @我 不重复投)。
 
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -32,7 +33,9 @@ case "$1 $2" in
                            *)  echo '{"id":"S2","handle":"other","member_ids":["UBOB"]}' ;;
                          esac ;;
   "users info")          case "${@: -1}" in UCI) echo '{"id":"UCI","name":"ci-bot"}' ;; *) echo '{"id":"UBOB","name":"bob"}' ;; esac ;;
-  "conversations read")  echo '{"messages":[{"ts":"9000000001.000100","user":"UBOB","text":"根消息"}],"users":[{"id":"UBOB","name":"bob"}]}' ;;
+  "conversations read")  tts=""; prev=""; for a in "$@"; do [ "$prev" = "--thread-ts" ] && tts="$a"; prev="$a"; done
+                         if [ -n "$tts" ] && [ -n "${THREADS_DIR:-}" ]; then cat "$THREADS_DIR/$tts.json" 2>/dev/null || echo '{"messages":[]}'
+                         else echo '{"messages":[{"ts":"9000000001.000100","user":"UBOB","text":"根消息"}],"users":[{"id":"UBOB","name":"bob"}]}'; fi ;;
   "search messages")     cat "$SEARCH_FILE" 2>/dev/null ;;
   "messages listen")     if [ "${3:-}" = "--help" ]; then
                            # OLD_SLACKCLI:学没有 listen 的老版本,commander 打 messages 组的帮助、退出 0
@@ -65,13 +68,16 @@ for line in sys.stdin:
     need = "NEED-YES" in body
     print(json.dumps({"type": "result", "result": json.dumps({"need": need, "reason": "桩判定"})}), flush=True)
 EOF
-# 投递桩:--check 通过;每次投递把说明全文追加进 $CALLS,FAILS 文件里的数字 > 0 时失败一次
+# 投递桩:--check 通过;每次投递把说明全文追加进 $CALLS,「ts 目标会话链接」追加进 $CALLS.targets;
+# FAILS 文件里的数字 > 0 时失败一次,目标会话链接含 $FAIL_TARGET 时总是失败
 cat > "$T/relay" <<'EOF'
 #!/bin/bash
 [ "$1" = "--check" ] && exit 0
 f=$(cat "$FAILS_FILE" 2>/dev/null || echo 0)
 if [ "$f" -gt 0 ]; then echo $((f - 1)) > "$FAILS_FILE"; echo "目标会话不可达" >&2; exit 2; fi
+if [ -n "${FAIL_TARGET:-}" ] && [[ "${WATCH_TARGET_SESSION_LINK:-}" == *"$FAIL_TARGET"* ]]; then echo "会话起不来" >&2; exit 2; fi
 { cat "$2"; echo; echo "====="; } >> "$CALLS"
+echo "$(grep -o 'ts [0-9.]*' "$2" | head -1 | cut -c4-) ${WATCH_TARGET_SESSION_LINK:-default}" >> "$CALLS.targets"
 echo "已投递到 uds:/tmp/stub.sock"
 EOF
 chmod +x "$T/slackcli" "$T/claude" "$T/relay"
@@ -181,6 +187,93 @@ python3 -c "import json,sys;p=sys.argv[1];d=json.load(open(p));d['seen']['900000
 run >/dev/null
 check "搜索结果里还在的 ts 续期,不会过期后重投" '[ "$(delivered 9000000030.000100)" = 0 ] && [ "$(jq ".seen[\"9000000030.000100\"] > 0" "$T/st/state.json")" = true ]'
 check "早就不出现的 ts 过期淘汰" '[ "$(jq ".seen | has(\"9000000031.000100\")" "$T/st/state.json")" = false ]'
+
+echo "== 跟踪名单 =="
+# 新的状态目录;名单是个目录,两个文件,一个写 CHANNEL:TS,一个写 Slack 链接和指定会话
+export SLACK_LIVE_STATE_DIR="$T/st2" THREADS_DIR="$T/threads" FAIL_TARGET="local_aaaaaaaa"
+SUB=local_11111111-2222-3333-4444-555555555555
+DEAD=local_aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee
+mkdir -p "$T/st2/tracked" "$T/threads"
+cat > "$T/st2/tracked/lead.txt" <<'EOF'
+# 注释行
+C7:9000000100.000100   # 行尾注释
+这一行看不懂
+EOF
+cat > "$T/st2/tracked/sub.txt" <<EOF
+https://example.slack.com/archives/C8/p9000000200000100?thread_ts=9000000200.000100&cid=C8 $SUB
+D5:9000000300.000100 claude://claude.ai/epitaxy/$DEAD
+EOF
+# C7 这个 thread 从 .000060 开始跟:更早的回复不投
+echo '{"seen":{},"started_at":0,"tracked_since":{"C7:9000000100.000100":9000000100.000060}}' > "$T/st2/state.json"
+cat > "$T/threads/9000000100.000100.json" <<'EOF'
+{"messages":[
+  {"ts":"9000000100.000100","user":"UBOB","text":"根消息"},
+  {"ts":"9000000100.000101","user":"UBOB","text":"实时通道也收到过的"},
+  {"ts":"9000000100.000500","user":"UCAT","text":"断线期间漏掉的回复"}
+],"users":[{"id":"UCAT","name":"cat"}]}
+EOF
+: > "$CALLS"; : > "$CALLS.targets"; : > "$TRIAGE_LOG"; : > "$SLACKCLI_LOG"; : > "$T/search.json"; echo 0 > "$FAILS_FILE"
+{
+  echo '{"type":"hello"}'
+  ev C7 9000000100.000050 UBOB "开始跟之前的回复" '{"thread_ts":"9000000100.000100"}'
+  ev C7 9000000100.000101 UBOB "实时通道也收到过的" '{"thread_ts":"9000000100.000100"}'
+  ev C7 9000000100.000102 UX   "机器人的回复" '{"thread_ts":"9000000100.000100","bot_id":"B9","username":"hermes"}'
+  ev C7 9000000100.000103 UME  "我自己补一句" '{"thread_ts":"9000000100.000100"}'
+  ev C7 9000000100.000104 UME  "[ 🐶 Claude:] agent 代我回复" '{"thread_ts":"9000000100.000100"}'
+  ev C7 9000000100.000100 UBOB "根消息" '{"thread_ts":"9000000100.000100"}'
+  ev C8 9000000200.000101 UBOB "<@UME> NEED-YES 跟踪的 thread 里又 @我" '{"thread_ts":"9000000200.000100"}'
+  ev C8 9000000200.000101 UBOB "<@UME> NEED-YES 跟踪的 thread 里又 @我" '{"thread_ts":"9000000200.000100"}'
+  ev D5 9000000300.000101 UBOB "私聊 thread 里的回复" '{"thread_ts":"9000000300.000100"}'
+  ev C9 9000000400.000101 UBOB "NEED-YES 没跟踪的 thread" '{"thread_ts":"9000000400.000100"}'
+} > "$T/events"
+rc=$(run)
+tgt() { awk -v ts="$1" '($1 "") == ts {print $2}' "$CALLS.targets"; }
+check "回放结束正常退出" '[ "$rc" = 0 ]'
+check "跟踪的 thread 里没 @我 的回复投给默认会话" '[ "$(delivered 9000000100.000101)" = 1 ] && [ "$(tgt 9000000100.000101)" = default ]'
+check "投递说明写明是跟踪的 thread 有新回复" 'grep -q "【Slack 触发】跟踪的 thread 有新回复 来自 bob (UBOB),channel C7,ts 9000000100.000101,thread_ts 9000000100.000100" "$CALLS"'
+check "跟踪的 thread 不走初判" '[ "$(triaged "实时通道也收到过的")" = 0 ] && [ "$(triaged "跟踪的 thread 里又")" = 0 ]'
+check "开始跟之前的回复不投" '[ "$(delivered 9000000100.000050)" = 0 ]'
+check "机器人的回复也投" '[ "$(delivered 9000000100.000102)" = 1 ]'
+check "我自己的回复不投" '[ "$(delivered 9000000100.000103)" = 0 ]'
+check "agent 前缀的回复不投" '[ "$(delivered 9000000100.000104)" = 0 ]'
+check "根消息本身不投" '[ -z "$(tgt 9000000100.000100)" ]'
+check "既 @我 又在名单里只投一次,投给指定的会话" '[ "$(delivered 9000000200.000101)" = 1 ] && [ "$(tgt 9000000200.000101)" = "claude://claude.ai/epitaxy/$SUB" ]'
+check "@了我的标出来" 'grep -q "跟踪的 thread 有新回复(也 @了我)" "$CALLS"'
+check "指定的会话投不到时改投默认会话,并说明原因" '[ "$(delivered 9000000300.000101)" = 1 ] && [ "$(tgt 9000000300.000101)" = default ] && grep -q "登记的是投给会话 $DEAD,那边投不到" "$CALLS"'
+check "没跟踪的 thread 照旧不处理" '[ "$(delivered 9000000400.000101)" = 0 ] && [ "$(triaged "没跟踪的 thread")" = 0 ]'
+check "补拉读了跟踪的 thread,从开始跟的时间读起" 'grep -q -- "conversations read --json --thread-ts 9000000100.000100 --oldest 9000000100.0000[56]" "$SLACKCLI_LOG"'
+check "补拉到实时通道漏掉的回复,投一次" '[ "$(delivered 9000000100.000500)" = 1 ]'
+check "补拉不重投实时通道收过的" '[ "$(delivered 9000000100.000101)" = 1 ]'
+check "看不懂的行跳过并记日志" 'grep -q "lead.txt 第 3 行看不懂" "$T/st2/log"'
+check "新加的 thread 记下了开始跟的时间" 'jq -e ".tracked_since[\"C8:9000000200.000100\"] > 0" "$T/st2/state.json" >/dev/null'
+check "老 thread 的开始时间不被重读覆盖" '[ "$(jq ".tracked_since[\"C7:9000000100.000100\"]" "$T/st2/state.json")" = 9000000100.00006 ]'
+
+# 热加载:不重启,名单变了下一轮就生效;没变不重读
+cat > "$T/reload.py" <<'EOF'
+import importlib.util, os, sys, time
+spec = importlib.util.spec_from_file_location("live", sys.argv[1])
+live = importlib.util.module_from_spec(spec); spec.loader.exec_module(live)
+d = sys.argv[2]; os.makedirs(d, exist_ok=True)
+state = {"started_at": 0}
+t = live.Tracker(d)
+open(os.path.join(d, "a.txt"), "w").write("C1:1790000000.000001\n")
+assert t.reload(state) == ["C1:1790000000.000001"]
+assert t.reload(state) is None, "没变不该重读"
+with open(os.path.join(d, "a.txt"), "a") as f:
+    f.write("C2:1790000000.000002 local_11111111-2222-3333-4444-555555555555\n")
+os.utime(os.path.join(d, "a.txt"), (time.time() + 5, time.time() + 5))
+assert t.reload(state) == ["C2:1790000000.000002"]
+assert t.threads["C2:1790000000.000002"] == "local_11111111-2222-3333-4444-555555555555"
+os.remove(os.path.join(d, "a.txt"))
+assert t.reload(state) == [] and t.threads == {} and state["tracked_since"] == {}
+assert live.parse_track_line("C1:1790000000.000001 local_bad") is None
+assert live.parse_track_line("http://x.slack.com/archives/C1/p1790000000000001") is None
+print("ok")
+EOF
+out=$(SLACK_LIVE_STATE_DIR="$T/st3" python3 "$T/reload.py" "$LIVE" "$T/st3/tracked" 2>&1 | tail -1)
+check "名单热加载:增删都生效,没变不重读,会话 id 不合法的行不认" '[ "$out" = ok ]'
+unset FAIL_TARGET THREADS_DIR
+export SLACK_LIVE_STATE_DIR="$T/st"
 
 echo "== 启动校验 =="
 cat > "$T/relay-bad" <<'EOF'

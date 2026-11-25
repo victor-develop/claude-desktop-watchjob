@@ -3,7 +3,7 @@
 
 收:`slackcli messages listen` 连 Slack RTM,消息推过来一两秒内收到;连上或重连时,以及每 BACKFILL_SECONDS 秒,
     用 search.messages 补拉断线期间漏掉的。两条路按 ts 共用 seen 去重。
-滤:只留私聊、@我、@我所在的用户组、投递过的 thread 里的后续消息;跳过我自己的消息(@我自己的除外,
+滤:只留私聊、@我、@我所在的用户组、投递过的 thread 里的后续消息、跟踪名单里 thread 的回复;跳过我自己的消息(@我自己的除外,
     带 AGENT_PREFIX 前缀的照样跳过)、SKIP_SENDERS 和附件含 SKIP_ATTACHMENT_KEYWORDS 的消息。
     全在本地,不调模型。
 判:剩下的交给常驻的 `claude -p`(stream-json,不给任何工具)判断要不要处理,每条判完发 /clear。
@@ -67,6 +67,14 @@ TRIAGE_MAX_TRIES = 3
 # 查我在哪些组要逐个读组成员,组多时要几分钟,所以结果缓存在 groups.json 里,隔几个小时才重查
 GROUPS_REFRESH_SECONDS = int(os.environ.get("GROUPS_REFRESH_SECONDS", "21600"))
 THREAD_CONTEXT_MESSAGES = 8
+# 跟踪名单:一个文件,或一个目录(下面每个文件都读)。每行 `CHANNEL:THREAD_TS [目标会话]`,也可以写 thread 的 Slack 链接。
+# 名单里的 thread 有人回复就直接投递,不初判;改了不用重启
+TRACK_THREADS = os.path.expanduser(os.environ.get("TRACK_THREADS", os.path.join(STATE_DIR, "tracked")))
+# 跟踪的 thread 除了连上、重连时补拉一遍,每隔这么久再补拉一遍;每轮主循环只读 TRACK_SCAN_BATCH 条,不堵实时消息
+TRACK_BACKFILL_SECONDS = int(os.environ.get("TRACK_BACKFILL_SECONDS", "1800"))
+TRACK_SCAN_BATCH = int(os.environ.get("TRACK_SCAN_BATCH", "5"))
+SESSION_ID_RE = re.compile(r"local_[0-9a-fA-F-]{8,64}")
+THREAD_TS_RE = re.compile(r"\d{9,10}\.\d{6}")
 
 
 def log(msg):
@@ -171,6 +179,8 @@ def is_dm(msg):
 
 
 def describe(msg):
+    if msg.get("_tracked"):
+        return "跟踪的 thread 有新回复" + ("(也 @了我)" if msg.get("_direct") else "")
     if is_dm(msg):
         return "私聊"
     if msg.get("_group"):
@@ -183,6 +193,8 @@ def describe(msg):
 
 
 def event_text(msg):
+    if msg.get("_tracked"):
+        return "跟踪名单里的 Slack thread 有新回复"
     if is_dm(msg):
         return "有人在 Slack 上私聊了我"
     if msg.get("_group"):
@@ -394,9 +406,18 @@ def is_bot(msg):
     return bool(msg.get("bot_id")) or msg.get("subtype") == "bot_message" or msg.get("user") == "USLACKBOT"
 
 
-def build_note(msg, reason):
+def build_note(msg, reason, fallback_from=""):
     sender = sender_label(msg)
     channel_id = (msg.get("channel") or {}).get("id", "")
+    if msg.get("_tracked"):
+        return (
+            "这是用户本人的 Slack 监听转来的消息:跟踪名单里的 thread 有新回复。先用 Slack 工具读原文和完整线程,"
+            "再按登记跟踪这个 thread 时定下的自主边界处理。\n"
+            f"【Slack 触发】{describe(msg)} 来自 {sender},channel {channel_id},ts {msg.get('ts', '')},"
+            f"thread_ts {thread_ts_of(msg)}\n"
+            f"链接:{msg.get('permalink', '')}"
+            + (f"\n这个 thread 登记的是投给会话 {fallback_from},那边投不到,先转给你" if fallback_from else "")
+        )
     return (
         "这是用户本人的 Slack 监听转来的消息,用户要你替他处理:先用 Slack 工具读原文和完整线程,"
         "再给用户一个结论(要他做什么、回复草稿,或者不用处理并说明原因)。不要发 Slack 消息,不要改文件。\n"
@@ -407,16 +428,29 @@ def build_note(msg, reason):
 
 
 def relay(msg, reason):
-    return relay_note(build_note(msg, reason))
+    """跟踪名单给这个 thread 指定了会话时投给它;投不到(会话归档了、起不来)就改投默认会话,不让消息卡在 pending 里。"""
+    target = msg.get("_track_target") or ""
+    if not target:
+        return relay_note(build_note(msg, reason))
+    try:
+        return relay_note(build_note(msg, reason), target)
+    except Exception as e:
+        log(f"投给跟踪名单指定的会话 {target} 失败,改投默认会话 {msg.get('ts')}: {e}")
+        return relay_note(build_note(msg, reason, fallback_from=target))
 
 
-def relay_note(note):
-    """交给 watch-relay.sh 投递:收件地址解析、唤醒、权限模式都在那边。"""
+def relay_note(note, target=""):
+    """交给 watch-relay.sh 投递:收件地址解析、唤醒、权限模式都在那边。target 是会话 id,给了就替换默认目标。"""
+    env = None
+    if target:
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("WATCH_TARGET_SESSION", "WATCH_TARGET_SESSION_ID", "WATCH_TARGET_SESSION_LINK")}
+        env["WATCH_TARGET_SESSION_LINK"] = f"claude://claude.ai/epitaxy/{target}"
     with tempfile.NamedTemporaryFile("w", dir=STATE_DIR, prefix="note.", suffix=".txt", delete=False) as f:
         f.write(note)
         path = f.name
     try:
-        proc = subprocess.run([RELAY_CMD, "--note-file", path], capture_output=True, text=True, timeout=600)
+        proc = subprocess.run([RELAY_CMD, "--note-file", path], capture_output=True, text=True, timeout=600, env=env)
     finally:
         os.unlink(path)
     if proc.returncode != 0:
@@ -425,7 +459,9 @@ def relay_note(note):
 
 
 def handle(msg, me_id, state):
-    if msg.get("_self"):
+    if msg.get("_tracked"):
+        need, reason = True, "跟踪名单里的 thread 有新回复,直接交给目标会话"
+    elif msg.get("_self"):
         need, reason = True, "我自己 @ 了自己,直接交给目标会话"
     elif is_dm(msg) and not is_bot(msg):
         # 真人私聊量小且基本都冲我来,小模型只看开头容易把长消息判成知会,直接交给目标会话
@@ -444,7 +480,8 @@ def handle(msg, me_id, state):
         log(f"{relay(msg, reason)} {msg['ts']}")
     except Exception as e:
         log(f"投递失败,排队等待重试 {msg['ts']}: {e}")
-        keep = ("ts", "thread_ts", "user", "username", "permalink", "_group", "_direct", "_followup", "_self")
+        keep = ("ts", "thread_ts", "user", "username", "permalink", "_group", "_direct", "_followup", "_self",
+                "_tracked", "_track_target")
         slim = {k: msg[k] for k in keep if k in msg}
         slim["channel"] = {k: v for k, v in (msg.get("channel") or {}).items() if k in ("id", "is_im")}
         state.setdefault("pending", []).append({"msg": slim, "reason": reason, "next_at": time.time() + RELAY_RETRY_SECONDS})
@@ -475,7 +512,7 @@ def is_agent_message(text):
 
 
 def screen(msg, me_id, groups, started_at, threads=None):
-    """判断一条消息要不要处理,返回 True 时已标好 _direct / _group / _followup / _self。"""
+    """判断一条消息要不要处理,返回 True 时已标好 _direct / _group / _followup / _self / _tracked。"""
     ts = msg.get("ts")
     if float(ts) < started_at:
         return False  # 启动之前的历史消息只记账不触发
@@ -492,7 +529,10 @@ def screen(msg, me_id, groups, started_at, threads=None):
         log(f"跳过 {ts},附件含 {hit_keyword}")
         return False
     msg["_direct"] = f"<@{me_id}>" in text
-    if not is_dm(msg) and not msg["_direct"]:
+    target = TRACKER.target(msg, me_id)
+    if target is not None:
+        msg["_tracked"], msg["_track_target"] = True, target
+    elif not is_dm(msg) and not msg["_direct"]:
         hit = [h for gid, h in groups.items() if f"<@{gid}>" in text or f"<!subteam^{gid}" in text]
         if hit:
             msg["_group"] = hit[0]
@@ -603,6 +643,10 @@ def backfill(me_id, queries, state, groups):
     for q in queries:
         matches.extend(search(q))
     learn_workspace_url(matches, state)
+    process_backfilled(matches, me_id, state, groups)
+
+
+def process_backfilled(matches, me_id, state, groups):
     seen = seen_map(state)
     fresh = {}
     for msg in matches:
@@ -619,6 +663,134 @@ def backfill(me_id, queries, state, groups):
     if fresh:
         log(f"补拉到 {len(fresh)} 条实时通道没收到的消息")
     process(list(fresh.values()), me_id, state)
+
+
+def parse_track_line(line):
+    """`CHANNEL:THREAD_TS [会话]` 或 `<thread 的 Slack 链接> [会话]`;会话写 local_<id> 或会话链接。看不懂返回 None。"""
+    parts = line.split()
+    if len(parts) > 2:
+        return None
+    spec, target = parts[0], (parts[1] if len(parts) > 1 else "")
+    m = re.fullmatch(r"([CDG][A-Z0-9]+):(\d{9,10}\.\d{6})", spec)
+    if m:
+        key = f"{m[1]}:{m[2]}"
+    else:
+        u = urllib.parse.urlparse(spec)
+        m = re.fullmatch(r"/archives/([CDG][A-Z0-9]+)/p(\d{10})(\d{6})", u.path)
+        if u.scheme != "https" or not m:
+            return None
+        thread_ts = urllib.parse.parse_qs(u.query).get("thread_ts", [f"{m[2]}.{m[3]}"])[0]
+        if not THREAD_TS_RE.fullmatch(thread_ts):
+            return None
+        key = f"{m[1]}:{thread_ts}"
+    if target:
+        target = target.rsplit("/", 1)[-1]
+        if not SESSION_ID_RE.fullmatch(target):
+            return None
+    return key, target
+
+
+class Tracker:
+    """跟踪名单 {channel:thread_ts: 目标会话 id,"" 是默认会话}。主循环每轮看一眼文件的 mtime,变了就重读。
+    since 记每个 thread 从什么时候开始跟(存在 state.json 的 tracked_since),更早的回复不投。"""
+
+    def __init__(self, path):
+        self.path, self.sig, self.threads, self.since = path, None, {}, {}
+
+    def files(self):
+        if os.path.isdir(self.path):
+            names = sorted(n for n in os.listdir(self.path)
+                           if not n.startswith(".") and not n.endswith(("~", ".tmp", ".swp")))
+            return [p for p in (os.path.join(self.path, n) for n in names) if os.path.isfile(p)]
+        return [self.path] if os.path.isfile(self.path) else []
+
+    def reload(self, state):
+        """名单没变返回 None;变了就重读,返回新加进来的 thread。新 thread 从它所在文件的修改时间开始跟。"""
+        sig = []
+        for f in self.files():
+            try:
+                st = os.stat(f)
+            except OSError:
+                continue
+            sig.append((f, st.st_mtime, st.st_size))
+        sig = tuple(sig)
+        if sig == self.sig:
+            return None
+        self.sig = sig
+        threads, first_at = {}, {}
+        for f, mtime, _ in sig:
+            try:
+                with open(f, encoding="utf-8") as fh:
+                    lines = fh.read().splitlines()
+            except (OSError, UnicodeDecodeError) as e:
+                log(f"读跟踪名单 {f} 失败,跳过: {e}")
+                continue
+            for n, raw in enumerate(lines, 1):
+                line = raw.split("#", 1)[0].strip()
+                if not line:
+                    continue
+                parsed = parse_track_line(line)
+                if not parsed:
+                    log(f"跟踪名单 {os.path.basename(f)} 第 {n} 行看不懂,跳过")
+                    continue
+                key, target = parsed
+                # 同一个 thread 写了几行时,指定了会话的那行优先
+                if target or key not in threads:
+                    threads[key] = target
+                first_at.setdefault(key, mtime)
+        since = state.setdefault("tracked_since", {})
+        added = [k for k in threads if k not in since]
+        for k in added:
+            since[k] = min(first_at[k], time.time())
+        removed = [k for k in since if k not in threads]
+        for k in removed:
+            del since[k]
+        self.threads, self.since = threads, since
+        log(f"跟踪名单 {len(threads)} 个 thread(新加 {len(added)},去掉 {len(removed)})")
+        return added
+
+    def target(self, msg, me_id):
+        """名单里 thread 的回复(不是根消息、不是我发的、在开始跟之后)返回目标会话 id;其他返回 None。"""
+        thread_ts = thread_ts_of(msg)
+        if not thread_ts or thread_ts == msg.get("ts") or msg.get("user") == me_id:
+            return None
+        key = thread_key(msg)
+        if key not in self.threads or float(msg["ts"]) <= self.since.get(key, 0):
+            return None
+        return self.threads[key]
+
+
+TRACKER = Tracker(TRACK_THREADS)
+
+
+def scan_tracked(keys, me_id, state, groups):
+    """读跟踪的 thread 里开始跟之后的回复,补实时通道断线期间漏掉的。"""
+    matches = []
+    for key in keys:
+        if key not in TRACKER.threads:
+            continue
+        channel_id, thread_ts = key.split(":", 1)
+        oldest = max(state["started_at"], TRACKER.since.get(key, 0))
+        try:
+            body = slackcli("conversations read", ("--thread-ts", thread_ts), ("--oldest", f"{oldest:.6f}"),
+                            ("--limit", 200),
+                            ("--fields", "ts,user,username,bot_id,subtype,text,attachments,files"), channel_id) or {}
+        except Exception as e:
+            log(f"补拉跟踪的 thread {key} 失败: {e}")
+            continue
+        for u in body.get("users") or []:
+            if u.get("id") and u.get("name"):
+                _user_names.setdefault(u["id"], u["name"])
+        for m in body.get("messages") or []:
+            if not m.get("ts") or m["ts"] == thread_ts:
+                continue
+            m["thread_ts"] = thread_ts
+            m["channel"] = {"id": channel_id, "is_im": channel_id.startswith("D")}
+            m["permalink"] = permalink(channel_id, m["ts"], thread_ts, state)
+            if not m.get("username") and m.get("user"):
+                m["username"] = user_name(m["user"])
+            matches.append(m)
+    process_backfilled(matches, me_id, state, groups)
 
 
 def start_listener():
@@ -693,8 +865,17 @@ def run(me_id, queries, exit_on_eof, listener):
     listener["proc"] = proc
     listener_started, restart_wait, alerted = time.time(), 5, False
     backfill_due = time.time() + BACKFILL_SECONDS
+    track_due, track_queue = time.time() + TRACK_BACKFILL_SECONDS, []
     streams_open = 2
     while True:
+        try:
+            if TRACKER.reload(state) is not None:
+                save_state(state)
+        except Exception as e:
+            log(f"读跟踪名单出错: {e}")
+        if time.time() >= track_due:
+            track_queue = list(TRACKER.threads)
+            track_due = time.time() + TRACK_BACKFILL_SECONDS
         if time.time() - groups_loaded_at > GROUPS_REFRESH_SECONDS:
             try:
                 groups = load_my_groups(me_id)
@@ -704,7 +885,7 @@ def run(me_id, queries, exit_on_eof, listener):
                 log(f"读取用户组失败,10 分钟后重试,这期间只看 @我 和私聊: {e}")
                 groups_loaded_at = time.time() - GROUPS_REFRESH_SECONDS + 600
         try:
-            kind, line = events.get(timeout=5)
+            kind, line = events.get(timeout=0.2 if track_queue else 5)
         except queue.Empty:
             kind, line = None, ""
         if kind == "exit":
@@ -712,6 +893,7 @@ def run(me_id, queries, exit_on_eof, listener):
             if streams_open == 0:
                 proc.wait()
                 if exit_on_eof:
+                    scan_tracked(track_queue, me_id, state, groups)
                     flush_retries(me_id, state)
                     flush_pending(state)
                     log("事件流读完,退出")
@@ -739,7 +921,7 @@ def run(me_id, queries, exit_on_eof, listener):
                 continue
             if ev.get("type") == "hello":
                 log("listen 已连上")
-                backfill_due = time.time()  # 刚连上或重连,补拉断线期间的消息
+                backfill_due = track_due = time.time()  # 刚连上或重连,补拉断线期间的消息
             elif ev.get("type") == "message":
                 try:
                     msg = from_rtm(ev, me_id, groups, state)
@@ -752,6 +934,12 @@ def run(me_id, queries, exit_on_eof, listener):
             flush_pending(state)
         except Exception as e:
             log(f"重试或重投出错: {e}")
+        if track_queue:
+            batch, track_queue = track_queue[:TRACK_SCAN_BATCH], track_queue[TRACK_SCAN_BATCH:]
+            try:
+                scan_tracked(batch, me_id, state, groups)
+            except Exception as e:
+                log(f"补拉跟踪的 thread 失败: {e}")
         if time.time() >= backfill_due:
             try:
                 backfill(me_id, queries + [f"@{h}" for h in sorted(groups.values())], state, groups)
